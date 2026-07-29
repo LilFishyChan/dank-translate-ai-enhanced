@@ -200,6 +200,15 @@ PluginSettings {
         defaultValue: true
     }
 
+    ToggleSetting {
+        settingKey: "disableThinking"
+        label: root.zh ? "DeepSeek 低延迟翻译" : "Low-latency DeepSeek translation"
+        description: root.zh
+            ? "对 DeepSeek 模型关闭思考模式，加快首字输出。"
+            : "Disables thinking mode for DeepSeek models to reduce time to first token."
+        defaultValue: true
+    }
+
     SliderSetting {
         settingKey: "timeoutSeconds"
         label: root.zh ? "请求超时" : "Timeout"

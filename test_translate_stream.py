@@ -4,6 +4,7 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 import translate_stream as client
 
@@ -33,6 +34,76 @@ class TranslateStreamTests(unittest.TestCase):
             client.render_prompt("Translate to ${target_lang}.", "简体中文"),
             "Translate to 简体中文.",
         )
+
+    def test_detects_deepseek_requests(self):
+        self.assertTrue(
+            client.is_deepseek_request(
+                "https://api.deepseek.com/v1/chat/completions",
+                "deepseek-v4-flash",
+            )
+        )
+        self.assertTrue(
+            client.is_deepseek_request(
+                "https://gateway.example.test/v1/chat/completions",
+                "deepseek-v4-pro",
+            )
+        )
+        self.assertFalse(
+            client.is_deepseek_request(
+                "https://api.openai.com/v1/chat/completions",
+                "gpt-5-mini",
+            )
+        )
+
+    def test_connection_resolves_ipv4_only(self):
+        connection_socket = mock.Mock()
+        resolved_address = ("192.0.2.10", 443)
+        with mock.patch(
+            "translate_stream.socket.getaddrinfo",
+            return_value=[
+                (
+                    client.socket.AF_INET,
+                    client.socket.SOCK_STREAM,
+                    client.socket.IPPROTO_TCP,
+                    "",
+                    resolved_address,
+                )
+            ],
+        ) as getaddrinfo, mock.patch(
+            "translate_stream.socket.socket", return_value=connection_socket
+        ):
+            result = client._create_ipv4_connection(("api.example.test", 443), 5)
+
+        getaddrinfo.assert_called_once_with(
+            "api.example.test",
+            443,
+            client.socket.AF_INET,
+            client.socket.SOCK_STREAM,
+        )
+        connection_socket.settimeout.assert_called_once_with(5)
+        connection_socket.connect.assert_called_once_with(resolved_address)
+        self.assertIs(result, connection_socket)
+
+    def test_run_disables_thinking_for_deepseek(self):
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch(
+            "translate_stream._request", return_value=True
+        ) as request:
+            client.run(
+                {
+                    "base_url": "https://api.deepseek.com/v1",
+                    "endpoint": "/chat/completions",
+                    "model": "deepseek-v4-flash",
+                    "target_lang": "Chinese (Simplified)",
+                    "prompt": "Translate to ${target_lang}.",
+                    "stream": True,
+                    "disable_thinking": True,
+                    "text": "hello",
+                }
+            )
+
+        payload = request.call_args.args[2]
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+        self.assertTrue(payload["stream"])
 
     def test_extract_stream_delta(self):
         data = {"choices": [{"delta": {"content": "你好"}}]}

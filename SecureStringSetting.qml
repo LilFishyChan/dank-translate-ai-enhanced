@@ -69,7 +69,7 @@ Column {
         id: secretField
         width: parent.width
         placeholderText: root.placeholder
-        echoMode: TextInput.Password
+        echoMode: secretField.passwordVisible ? TextInput.Normal : TextInput.Password
         showPasswordToggle: true
         onEditingFinished: root.commit()
         onActiveFocusChanged: {

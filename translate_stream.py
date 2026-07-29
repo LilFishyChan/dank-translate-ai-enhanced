@@ -8,12 +8,12 @@ The QML daemon writes one JSON request to stdin. This helper emits NDJSON events
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import sys
 import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -66,6 +66,44 @@ def build_url(base_url: str, endpoint: str) -> str:
 
 def render_prompt(prompt: str, target_lang: str) -> str:
     return prompt.replace("${target_lang}", target_lang)
+
+
+def is_deepseek_request(url: str, model: str) -> bool:
+    hostname = (urllib.parse.urlparse(url).hostname or "").lower()
+    return hostname == "api.deepseek.com" or model.lower().startswith("deepseek-")
+
+
+def _create_ipv4_connection(
+    address: tuple[str, int],
+    timeout: object = socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address: tuple[str, int] | None = None,
+    *,
+    all_errors: bool = False,
+) -> socket.socket:
+    host, port = address
+    errors: list[OSError] = []
+    for family, socktype, proto, _, socket_address in socket.getaddrinfo(
+        host, port, socket.AF_INET, socket.SOCK_STREAM
+    ):
+        connection_socket: socket.socket | None = None
+        try:
+            connection_socket = socket.socket(family, socktype, proto)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                connection_socket.settimeout(timeout)
+            if source_address:
+                connection_socket.bind(source_address)
+            connection_socket.connect(socket_address)
+            return connection_socket
+        except OSError as exc:
+            errors.append(exc)
+            if connection_socket is not None:
+                connection_socket.close()
+
+    if all_errors and errors:
+        raise ExceptionGroup("IPv4 connection failed", errors)
+    if errors:
+        raise errors[-1]
+    raise OSError("getaddrinfo returned no IPv4 addresses")
 
 
 def _content_to_text(content: Any) -> str:
@@ -143,57 +181,80 @@ def _parse_json(text: str) -> dict[str, Any]:
     return value
 
 
+def _consume_response(response: Any, payload: dict[str, Any]) -> bool:
+    content_type = response.headers.get("Content-Type", "").lower()
+    streaming = bool(payload.get("stream"))
+
+    if streaming or "text/event-stream" in content_type:
+        has_translation = False
+        for event_payload in _iter_sse_payloads(response):
+            if event_payload == "[DONE]":
+                break
+            try:
+                data = _parse_json(event_payload)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            api_error = extract_api_error(data)
+            if api_error:
+                raise RuntimeError(api_error)
+            delta = extract_choice_content(data)
+            if delta:
+                has_translation = has_translation or bool(delta.strip())
+                emit("delta", text=delta)
+        return has_translation
+
+    raw_bytes = response.read(MAX_RESPONSE_BODY + 1)
+    if len(raw_bytes) > MAX_RESPONSE_BODY:
+        raise RuntimeError(tr("Response exceeds 16 MiB.", "响应超过 16 MiB。"))
+    data = _parse_json(raw_bytes.decode("utf-8", errors="replace"))
+    api_error = extract_api_error(data)
+    if api_error:
+        raise RuntimeError(api_error)
+    text = extract_choice_content(data)
+    if text:
+        emit("delta", text=text)
+    return bool(text.strip())
+
+
 def _request(
     url: str,
     headers: dict[str, str],
     payload: dict[str, Any],
     timeout: float,
 ) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ConfigError(tr("Invalid HTTP(S) URL.", "HTTP(S) 地址无效。"))
+
+    connection_type = (
+        http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    )
+    connection = connection_type(hostname, parsed.port, timeout=timeout)
+    connection._create_connection = _create_ipv4_connection
+    path = urllib.parse.urlunparse(("", "", parsed.path or "/", parsed.params, parsed.query, ""))
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
     try:
-        response = urllib.request.urlopen(request, timeout=timeout)
-    except urllib.error.HTTPError as exc:
+        connection.request("POST", path, body=body, headers=headers)
+        response = connection.getresponse()
         try:
-            error_body = exc.read(MAX_ERROR_BODY).decode("utf-8", errors="replace")
+            if response.status >= 400:
+                error_body = response.read(MAX_ERROR_BODY).decode("utf-8", errors="replace")
+                raise ApiResponseError(response.status, error_body)
+            return _consume_response(response, payload)
         finally:
-            exc.close()
-        raise ApiResponseError(exc.code, error_body) from exc
-
-    with response:
-        content_type = response.headers.get("Content-Type", "").lower()
-        streaming = bool(payload.get("stream"))
-
-        if streaming or "text/event-stream" in content_type:
-            has_translation = False
-            for event_payload in _iter_sse_payloads(response):
-                if event_payload == "[DONE]":
-                    break
-                try:
-                    data = _parse_json(event_payload)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                api_error = extract_api_error(data)
-                if api_error:
-                    raise RuntimeError(api_error)
-                delta = extract_choice_content(data)
-                if delta:
-                    has_translation = has_translation or bool(delta.strip())
-                    emit("delta", text=delta)
-            return has_translation
-
-        raw_bytes = response.read(MAX_RESPONSE_BODY + 1)
-        if len(raw_bytes) > MAX_RESPONSE_BODY:
-            raise RuntimeError(tr("Response exceeds 16 MiB.", "响应超过 16 MiB。"))
-        data = _parse_json(raw_bytes.decode("utf-8", errors="replace"))
-        api_error = extract_api_error(data)
-        if api_error:
-            raise RuntimeError(api_error)
-        text = extract_choice_content(data)
-        if text:
-            emit("delta", text=text)
-        return bool(text.strip())
+            response.close()
+    except (TimeoutError, socket.timeout):
+        raise
+    except ApiResponseError:
+        raise
+    except OSError as exc:
+        raise urllib.error.URLError(exc) from exc
+    except http.client.HTTPException as exc:
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        connection.close()
 
 
 def run(config: dict[str, Any]) -> None:
@@ -222,10 +283,12 @@ def run(config: dict[str, Any]) -> None:
         raise ConfigError(tr("Prompt is empty.", "提示词为空。"))
 
     url = build_url(base_url, endpoint)
+    deepseek_request = is_deepseek_request(url, model)
+    disable_thinking = bool(config.get("disable_thinking", True)) and deepseek_request
     headers = {
         "Accept": "text/event-stream, application/json",
         "Content-Type": "application/json",
-        "User-Agent": "DankTranslateAI/1.0.0",
+        "User-Agent": "DankTranslateAI/1.0.2",
     }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -239,8 +302,16 @@ def run(config: dict[str, Any]) -> None:
     }
     if model:
         payload["model"] = model
+    if disable_thinking:
+        payload["thinking"] = {"type": "disabled"}
 
-    emit("meta", url=url, model=model, streaming=streaming)
+    emit(
+        "meta",
+        url=url,
+        model=model,
+        streaming=streaming,
+        thinking_disabled=disable_thinking,
+    )
     try:
         has_translation = _request(url, headers, payload, timeout)
     except ApiResponseError as exc:

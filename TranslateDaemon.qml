@@ -17,6 +17,7 @@ PluginComponent {
     readonly property string captureHelperPath: pluginPath ? pluginPath + "/capture_selection.py" : ""
     readonly property int maxInputChars: 100000
     readonly property int clipboardFreshnessMs: 60000
+    readonly property int primaryFreshnessMs: 15000
     readonly property int selfCopyMatchMs: 3000
 
     property bool initialized: false
@@ -29,12 +30,15 @@ PluginComponent {
     property string currentTranslation: ""
     property string currentError: ""
     property string currentStatus: "idle"
+    property string currentPhase: "idle"
     property string currentLanguage: "Chinese (Simplified)"
     property int inputRequestSerial: 0
     property bool inputBaselineReady: false
     property string lastClipboardEntryId: ""
-    property string lastPrimarySnapshot: ""
     property string pendingInputMode: "selection"
+    property double primaryWatcherStartedAt: 0
+    property double lastPrimaryChangeAt: 0
+    property var pendingHistorySave: []
 
     function t(en, zh) {
         return uiZh ? zh : en;
@@ -89,6 +93,90 @@ PluginComponent {
         }
     }
 
+    Timer {
+        id: helperStartTimer
+        interval: 10000
+        repeat: false
+        onTriggered: {
+            const process = root.activeProcess;
+            if (process && !process.requestAccepted) {
+                root.failActiveProcess(
+                    process,
+                    root.t(
+                        "The translation helper did not accept the request.",
+                        "翻译进程未能接收请求。"
+                    )
+                );
+            }
+        }
+    }
+
+    Timer {
+        id: requestTimeoutTimer
+        repeat: false
+        onTriggered: {
+            const process = root.activeProcess;
+            if (process) {
+                root.failActiveProcess(
+                    process,
+                    root.t("Request timed out.", "请求超时。")
+                );
+            }
+        }
+    }
+
+    Timer {
+        id: primaryWatcherRestartTimer
+        interval: 2000
+        repeat: false
+        onTriggered: root.startPrimaryWatcher()
+    }
+
+    Timer {
+        id: historySaveRetryTimer
+        interval: 350
+        repeat: false
+        onTriggered: {
+            if (root.pluginService) {
+                root.pluginService.savePluginState(
+                    root.pluginId,
+                    "history",
+                    root.pendingHistorySave
+                );
+            }
+        }
+    }
+
+    Process {
+        id: primaryWatcher
+        command: [
+            "wl-paste", "--primary", "--watch",
+            "sh", "-c", "printf 'selection-changed\\n'"
+        ]
+        running: false
+
+        stdout: SplitParser {
+            splitMarker: "\n"
+            onRead: line => {
+                if (!line)
+                    return;
+                const now = Date.now();
+                // wl-paste may announce the selection that existed at startup.
+                if (now - root.primaryWatcherStartedAt < 1000)
+                    return;
+                root.lastPrimaryChangeAt = now;
+            }
+        }
+
+        stderr: StdioCollector {}
+
+        onStarted: root.primaryWatcherStartedAt = Date.now()
+        onExited: {
+            if (!root.ipcStopping)
+                primaryWatcherRestartTimer.restart();
+        }
+    }
+
     function initialize() {
         if (initialized || !pluginService || !pluginId)
             return;
@@ -101,7 +189,9 @@ PluginComponent {
         globalOriginal.set("");
         globalTranslation.set("");
         globalError.set("");
+        currentPhase = "idle";
         initialized = true;
+        persistHistory(saved);
         trimHistory();
     }
 
@@ -111,6 +201,14 @@ PluginComponent {
 
         ipc.target = pluginId;
         ipc.enabled = true;
+    }
+
+    function startPrimaryWatcher() {
+        if (ipcStopping || primaryWatcher.running)
+            return;
+        primaryWatcherStartedAt = 0;
+        lastPrimaryChangeAt = 0;
+        primaryWatcher.running = true;
     }
 
     function deactivateIpc() {
@@ -124,8 +222,12 @@ PluginComponent {
         ipc.target = "";
 
         inputDebounceTimer.stop();
+        primaryWatcherRestartTimer.stop();
         ++inputRequestSerial;
         cancelActive(false);
+
+        if (primaryWatcher.running)
+            primaryWatcher.signal(15);
 
         if (activeCapture) {
             activeCapture.signal(15);
@@ -136,6 +238,7 @@ PluginComponent {
     Component.onCompleted: {
         Qt.callLater(initialize);
         Qt.callLater(activateIpc);
+        Qt.callLater(startPrimaryWatcher);
     }
     Component.onDestruction: deactivateIpc()
     onPluginIdChanged: {
@@ -172,8 +275,16 @@ PluginComponent {
         const trimmed = history.slice(0, historyLimit());
         if (trimmed.length !== history.length) {
             globalHistory.set(trimmed);
-            pluginService.savePluginState(pluginId, "history", trimmed);
+            persistHistory(trimmed);
         }
+    }
+
+    function persistHistory(history) {
+        if (!pluginService)
+            return;
+        pendingHistorySave = Array.isArray(history) ? history.slice() : [];
+        pluginService.savePluginState(pluginId, "history", pendingHistorySave);
+        historySaveRetryTimer.restart();
     }
 
     function syncCurrentState() {
@@ -197,6 +308,7 @@ PluginComponent {
         currentTranslation = "";
         currentError = String(message || t("Translation failed", "翻译失败"));
         currentStatus = "error";
+        currentPhase = "error";
         syncCurrentState();
         showPopup();
     }
@@ -226,11 +338,28 @@ PluginComponent {
             const clipboardChanged = state.entry
                 && (!inputBaselineReady || state.currentId !== lastClipboardEntryId);
             if (clipboardChanged) {
-                captureText(false, true, state.currentId, "input", "");
+                captureText(false, true, state.currentId);
                 return;
             }
-            captureText(true, true, state.currentId, "input", "");
+            if (primarySelectionIsFresh()) {
+                captureText(true, true, state.currentId);
+                return;
+            }
+            presentError(
+                t(
+                    "Select text or copy it, then press the shortcut.",
+                    "请划词或复制文本后再按快捷键。"
+                ),
+                ""
+            );
         });
+    }
+
+    function primarySelectionIsFresh() {
+        const age = Date.now() - lastPrimaryChangeAt;
+        return lastPrimaryChangeAt > 0
+            && age >= -selfCopyMatchMs
+            && age <= primaryFreshnessMs;
     }
 
     function resolveClipboardInput(requestSerial) {
@@ -240,7 +369,7 @@ PluginComponent {
             const clipboardChanged = state.entry
                 && (!inputBaselineReady || state.currentId !== lastClipboardEntryId);
             if (clipboardChanged) {
-                captureText(false, true, state.currentId, "input", "");
+                captureText(false, true, state.currentId);
                 return;
             }
             if (inputBaselineReady)
@@ -298,7 +427,7 @@ PluginComponent {
         });
     }
 
-    function captureText(primarySelection, smartInput, clipboardEntryId, captureRole, pendingText) {
+    function captureText(primarySelection, smartInput, clipboardEntryId) {
         if (activeCapture) {
             activeCapture.signal(15);
             activeCapture = null;
@@ -306,9 +435,7 @@ PluginComponent {
         const reader = selectionReaderComponent.createObject(root, {
             primarySelection: primarySelection,
             smartInput: !!smartInput,
-            clipboardEntryId: String(clipboardEntryId || ""),
-            captureRole: String(captureRole || "input"),
-            pendingText: String(pendingText || "")
+            clipboardEntryId: String(clipboardEntryId || "")
         });
         activeCapture = reader;
         reader.running = true;
@@ -321,41 +448,15 @@ PluginComponent {
         const text = String(reader.capturedText || "").trim();
         console.info("[DankTranslateAI] selection capture:", reader.primarySelection ? "primary" : "clipboard", "exit", exitCode, "chars", text.length);
 
-        if (reader.captureRole === "clipboardBaseline") {
-            lastPrimarySnapshot = exitCode === 0 ? text : "";
-            lastClipboardEntryId = reader.clipboardEntryId;
-            inputBaselineReady = true;
-            startTranslation(reader.pendingText);
-            return;
-        }
-
         if (exitCode === 0 && text.length > 0) {
-            if (!reader.primarySelection) {
-                captureText(
-                    true,
-                    true,
-                    reader.clipboardEntryId,
-                    "clipboardBaseline",
-                    text
-                );
-                return;
-            }
-
-            const unchanged = inputBaselineReady
-                && text === lastPrimarySnapshot
-                && reader.clipboardEntryId === lastClipboardEntryId;
-            lastPrimarySnapshot = text;
             lastClipboardEntryId = reader.clipboardEntryId;
-            if (unchanged)
-                return;
             inputBaselineReady = true;
             startTranslation(text);
             return;
         }
 
-        if (reader.primarySelection && reader.smartInput && inputBaselineReady) {
-            lastPrimarySnapshot = "";
-            lastClipboardEntryId = reader.clipboardEntryId;
+        if (reader.primarySelection && reader.smartInput) {
+            captureText(false, true, reader.clipboardEntryId);
             return;
         }
         if (exitCode === 6) {
@@ -431,6 +532,7 @@ PluginComponent {
         currentTranslation = "";
         currentError = "";
         currentStatus = "running";
+        currentPhase = "starting";
         currentLanguage = targetLanguage;
         syncCurrentState();
         showPopup();
@@ -443,6 +545,7 @@ PluginComponent {
             target_lang: targetLanguage,
             prompt: String(pluginData?.prompt ?? defaultPrompt),
             stream: pluginData?.streaming ?? true,
+            disable_thinking: pluginData?.disableThinking ?? true,
             timeout: Number(pluginData?.timeoutSeconds ?? 120),
             ui_language: uiZh ? "zh" : "en",
             text: text
@@ -452,6 +555,9 @@ PluginComponent {
             requestData: request
         });
         activeProcess = process;
+        helperStartTimer.restart();
+        requestTimeoutTimer.interval = Math.ceil((request.timeout + 10) * 1000);
+        requestTimeoutTimer.restart();
         process.running = true;
     }
 
@@ -468,7 +574,15 @@ PluginComponent {
         }
 
         switch (event.type) {
+        case "meta":
+            process.requestAccepted = true;
+            currentPhase = "waiting";
+            helperStartTimer.stop();
+            break;
         case "delta":
+            process.requestAccepted = true;
+            currentPhase = "streaming";
+            helperStartTimer.stop();
             currentTranslation += String(event.text || "");
             globalTranslation.set(currentTranslation);
             break;
@@ -478,8 +592,11 @@ PluginComponent {
             break;
         case "error":
             process.protocolError = true;
+            helperStartTimer.stop();
+            requestTimeoutTimer.stop();
             currentError = String(event.message || t("Translation failed", "翻译失败"));
             currentStatus = "error";
+            currentPhase = "error";
             syncCurrentState();
             break;
         }
@@ -489,17 +606,21 @@ PluginComponent {
         if (process.finishedHandled)
             return;
         process.finishedHandled = true;
+        helperStartTimer.stop();
+        requestTimeoutTimer.stop();
         const translated = currentTranslation.trim();
         if (!translated) {
             process.protocolError = true;
             currentError = t("Empty translation.", "译文为空。")
             currentStatus = "error";
+            currentPhase = "error";
             syncCurrentState();
             return;
         }
 
         currentTranslation = translated;
         currentStatus = "done";
+        currentPhase = "done";
         currentError = "";
         syncCurrentState();
         addHistory(currentOriginal, currentTranslation, currentLanguage);
@@ -507,8 +628,11 @@ PluginComponent {
 
     function onTranslationExited(process, exitCode) {
         const isCurrent = process === activeProcess;
-        if (isCurrent)
+        if (isCurrent) {
             activeProcess = null;
+            helperStartTimer.stop();
+            requestTimeoutTimer.stop();
+        }
         if (!isCurrent || process.cancelled)
             return;
         if (process.gotDone || process.finishedHandled || process.protocolError)
@@ -521,6 +645,21 @@ PluginComponent {
         const details = (process.stderrText || process.protocolNoise || t("Translation process ended early.", "翻译进程提前结束。")).trim();
         currentError = details;
         currentStatus = "error";
+        currentPhase = "error";
+        syncCurrentState();
+    }
+
+    function failActiveProcess(process, message) {
+        if (process !== activeProcess)
+            return;
+        activeProcess = null;
+        process.cancelled = true;
+        process.signal(15);
+        helperStartTimer.stop();
+        requestTimeoutTimer.stop();
+        currentError = String(message || t("Translation failed", "翻译失败"));
+        currentStatus = "error";
+        currentPhase = "error";
         syncCurrentState();
     }
 
@@ -531,8 +670,11 @@ PluginComponent {
         activeProcess = null;
         process.cancelled = true;
         process.signal(15);
+        helperStartTimer.stop();
+        requestTimeoutTimer.stop();
         if (showStatus) {
             currentStatus = "cancelled";
+            currentPhase = "cancelled";
             currentError = t("Stopped", "已停止");
             syncCurrentState();
         }
@@ -549,24 +691,29 @@ PluginComponent {
             createdAt: now
         };
         let history = Array.isArray(globalHistory.value) ? globalHistory.value.slice() : [];
+        const duplicate = history.some(item =>
+            String(item.original || "") === original
+                && String(item.translated || "") === translated
+                && String(item.language || "") === language
+        );
+        if (duplicate)
+            return;
         history.unshift(entry);
         history = history.slice(0, historyLimit());
         globalHistory.set(history);
-        pluginService.savePluginState(pluginId, "history", history);
+        persistHistory(history);
     }
 
     function clearHistory() {
         globalHistory.set([]);
-        if (pluginService)
-            pluginService.savePluginState(pluginId, "history", []);
+        persistHistory([]);
     }
 
     function removeHistoryEntry(entryId) {
         const history = Array.isArray(globalHistory.value) ? globalHistory.value : [];
         const filtered = history.filter(entry => String(entry.id) !== String(entryId));
         globalHistory.set(filtered);
-        if (pluginService)
-            pluginService.savePluginState(pluginId, "history", filtered);
+        persistHistory(filtered);
     }
 
     function updateBarPlacement(section, shouldAdd) {
@@ -619,8 +766,6 @@ PluginComponent {
             property bool primarySelection: true
             property bool smartInput: false
             property string clipboardEntryId: ""
-            property string captureRole: "input"
-            property string pendingText: ""
             property string capturedText: ""
 
             environment: {
@@ -664,6 +809,7 @@ PluginComponent {
             property bool finishedHandled: false
             property bool protocolError: false
             property bool cancelled: false
+            property bool requestAccepted: false
             property string stderrText: ""
             property string protocolNoise: ""
 
@@ -694,7 +840,7 @@ PluginComponent {
                 }
             }
 
-            onStarted: write(JSON.stringify(requestData) + "\n")
+            onStarted: translateProcess.write(JSON.stringify(requestData) + "\n")
 
             onExited: (exitCode, exitStatus) => {
                 root.onTranslationExited(translateProcess, exitCode);
@@ -756,6 +902,7 @@ PluginComponent {
         function status(): string {
             return JSON.stringify({
                 state: root.currentStatus,
+                phase: root.currentPhase,
                 original: root.currentOriginal,
                 translation: root.currentTranslation,
                 error: root.currentError,
@@ -920,7 +1067,9 @@ PluginComponent {
                             height: implicitHeight
                             text: root.currentStatus === "error"
                                 ? root.currentError
-                                : (root.currentTranslation || root.t("Connecting…", "连接中…"))
+                                : (root.currentTranslation || (root.currentPhase === "waiting"
+                                    ? root.t("Waiting for model…", "等待模型响应…")
+                                    : root.t("Starting translator…", "正在启动翻译…")))
                             color: root.currentStatus === "error" ? Theme.error : Theme.surfaceText
                             font.pixelSize: Theme.fontSizeMedium
                             wrapMode: Text.WordWrap
