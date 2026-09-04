@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A security-focused DankMaterialShell 1.5+ translation plugin. Press one shortcut after selecting or copying text; translation streams into a compact top-center card, while DankBar keeps a persistent newest-first history.
+A security-focused DankMaterialShell 1.6+ translation plugin. Press one shortcut after selecting or copying text; translation streams into a compact top-center card, while DankBar keeps a persistent newest-first history.
 
 ![Selection translation overlay](docs/translation-popup.png)
 
@@ -17,8 +17,10 @@ A security-focused DankMaterialShell 1.5+ translation plugin. Press one shortcut
 - Repeated shortcuts are coalesced, and exact duplicate history entries are stored once
 - Local best-effort secret screening before clipboard text reaches an API
 - Plain-text MIME allowlist, file/URI rejection, and a 100,000-character limit
-- Any OpenAI-compatible cloud API or local model server
-- Custom API Key, Base URL, endpoint, model ID, prompt, and target language
+- Local-first routing for any OpenAI-compatible model server
+- Automatic remote API fallback after local connection, timeout, HTTP, stream, or empty-response failures
+- Separate local and remote credentials, endpoints, model IDs, and timeouts
+- A muted `local` / `api` source label in the result card and translation history
 - IPv4 transport for every HTTP(S) API, with SSE streaming and complete JSON response support
 - Compact persistent result card with scrolling and stop, close, and copy actions
 - Newest-first DankBar history with copy, delete, and clear actions
@@ -51,7 +53,9 @@ This scope gives reviewers a clear distinction: AI and local-model support, stre
 
 This supports text copied from DMS Clipboard History and apps that place selected text on the regular clipboard. The resident watcher sends change markers to QML; source text is captured for translation after the shortcut. The metadata query, MIME checks, size checks, and secret scan stay local. Only the chosen source text enters the configured translation request.
 
-Clipboard screening recognizes password-manager MIME hints, credential labels, private keys, authorization headers, JWTs, common provider key formats, credential-bearing connection URLs, PIN-like values, hashes, and high-entropy mixed strings. Detection is intentionally conservative and remains a best-effort safety layer. The API Key is passed to the short-lived adapter through standard input and stays out of process arguments.
+Clipboard screening recognizes password-manager MIME hints, credential labels, private keys, authorization headers, JWTs, common provider key formats, credential-bearing connection URLs, PIN-like values, hashes, and high-entropy mixed strings. Detection is intentionally conservative and remains a best-effort safety layer. API keys are passed to the short-lived adapter through standard input and stay out of process arguments.
+
+Setting a local model ID enables local-first routing. A successful local response completes entirely on the local route. A local failure clears any partial local output before the adapter sends the source text to the configured remote API. The remote-fallback toggle provides a strict-local mode for sensitive workflows.
 
 Copies made by the plugin carry a short local marker, so the next shortcut avoids selecting the plugin's own output as a fresh input.
 
@@ -67,11 +71,11 @@ uv run --project /path/to/dankTranslateAI --offline --frozen /path/to/dankTransl
 
 Each input capture and translation uses a short-lived process. Completion, cancellation, and timeout release HTTP responses, pipes, and child processes. A lightweight resident `wl-paste` watcher tracks primary-selection freshness. The Python adapter runs only during a translation and parses streaming responses line by line.
 
-The standard-library HTTP adapter resolves every cloud and local HTTP(S) API connection through IPv4. SSE response chunks continue directly into the result card. DeepSeek requests can disable thinking mode through the low-latency setting to reduce time to first token.
+The standard-library HTTP adapter resolves every cloud and local HTTP(S) API connection through IPv4. SSE response chunks continue directly into the result card. DeepSeek requests can disable thinking mode through the low-latency setting to reduce time to first token. Local and remote attempts share one helper process, so fallback preserves cancellation and timeout ownership.
 
 Requirements:
 
-- DankMaterialShell 1.5+
+- DankMaterialShell 1.6+
 - `uv`
 - `wl-paste` from `wl-clipboard`
 
@@ -86,7 +90,7 @@ cp -a dank-translate-ai ~/.config/DankMaterialShell/plugins/dankTranslateAI
 Then:
 
 1. Scan and enable **Dank Translate AI** in DMS Settings → Plugins.
-2. Enter the API settings and target language.
+2. Enter a local model, a remote API, or both, then choose the target language.
 3. Add the plugin to a DankBar section.
 4. Click the keyboard icon under Shortcut and press a key combination. `Esc` cancels recording.
 
@@ -123,11 +127,11 @@ dms ipc call dankTranslateAI addToBar right
 dms ipc call dankTranslateAI removeFromBar right
 ```
 
-## API configuration
+## Local-first routing
 
-The plugin sends OpenAI Chat Completions requests. Provider presets stay out of the UI; enter the values exposed by the chosen cloud API or local server.
+The plugin sends OpenAI Chat Completions requests. A configured local model always receives the first attempt. The remote API receives the request only after a local failure. Leaving the local model empty routes directly to the API.
 
-Default local example:
+Local example:
 
 ```text
 Base URL: http://127.0.0.1:8080/v1
@@ -142,6 +146,8 @@ Base URL: https://api.deepseek.com
 Endpoint: /chat/completions
 Model: deepseek-v4-flash
 ```
+
+The default local timeout is 15 seconds and includes model cold-start time. Remote fallback is enabled by default and can be disabled in settings. Version 1.0 settings are read as compatibility defaults: loopback/private endpoints become the local route, while public endpoints become the remote route.
 
 The default prompt uses `${target_lang}`. Settings include common languages covering most regions plus a custom target field.
 

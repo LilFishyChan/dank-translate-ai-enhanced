@@ -2,8 +2,10 @@
 """Small OpenAI-compatible streaming client for Dank Translate AI.
 
 The QML daemon writes one JSON request to stdin. This helper emits NDJSON events:
-{"type":"delta","text":"..."}, {"type":"done"}, or
-{"type":"error","message":"..."}.
+{"type":"meta","source":"local|api"},
+{"type":"delta","source":"local|api","text":"..."},
+{"type":"fallback","from_source":"local","to_source":"api"},
+{"type":"done","source":"local|api"}, or {"type":"error","message":"..."}.
 """
 
 from __future__ import annotations
@@ -33,6 +35,10 @@ class ConfigError(ValueError):
     pass
 
 
+class TranslationError(RuntimeError):
+    pass
+
+
 @dataclass
 class ApiResponseError(Exception):
     status: int
@@ -41,6 +47,16 @@ class ApiResponseError(Exception):
     def __str__(self) -> str:
         detail = self.body.strip() or "empty response body"
         return f"HTTP {self.status}: {detail[:MAX_ERROR_BODY]}"
+
+
+@dataclass(frozen=True)
+class RouteConfig:
+    source: str
+    base_url: str
+    endpoint: str
+    api_key: str
+    model: str
+    timeout: float
 
 
 def emit(event_type: str, **payload: Any) -> None:
@@ -181,7 +197,7 @@ def _parse_json(text: str) -> dict[str, Any]:
     return value
 
 
-def _consume_response(response: Any, payload: dict[str, Any]) -> bool:
+def _consume_response(response: Any, payload: dict[str, Any], source: str) -> bool:
     content_type = response.headers.get("Content-Type", "").lower()
     streaming = bool(payload.get("stream"))
 
@@ -200,7 +216,7 @@ def _consume_response(response: Any, payload: dict[str, Any]) -> bool:
             delta = extract_choice_content(data)
             if delta:
                 has_translation = has_translation or bool(delta.strip())
-                emit("delta", text=delta)
+                emit("delta", source=source, text=delta)
         return has_translation
 
     raw_bytes = response.read(MAX_RESPONSE_BODY + 1)
@@ -212,7 +228,7 @@ def _consume_response(response: Any, payload: dict[str, Any]) -> bool:
         raise RuntimeError(api_error)
     text = extract_choice_content(data)
     if text:
-        emit("delta", text=text)
+        emit("delta", source=source, text=text)
     return bool(text.strip())
 
 
@@ -221,6 +237,7 @@ def _request(
     headers: dict[str, str],
     payload: dict[str, Any],
     timeout: float,
+    source: str,
 ) -> bool:
     parsed = urllib.parse.urlparse(url)
     hostname = parsed.hostname
@@ -242,7 +259,7 @@ def _request(
             if response.status >= 400:
                 error_body = response.read(MAX_ERROR_BODY).decode("utf-8", errors="replace")
                 raise ApiResponseError(response.status, error_body)
-            return _consume_response(response, payload)
+            return _consume_response(response, payload, source)
         finally:
             response.close()
     except (TimeoutError, socket.timeout):
@@ -257,23 +274,135 @@ def _request(
         connection.close()
 
 
+def _coerce_timeout(value: Any, default: float, maximum: float = 600.0) -> float:
+    try:
+        return max(3.0, min(float(value or default), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
+def _route_from_mapping(
+    source: str,
+    value: Any,
+    default_timeout: float,
+) -> RouteConfig | None:
+    if not isinstance(value, dict):
+        return None
+    model = str(value.get("model") or "").strip()
+    base_url = str(value.get("base_url") or "").strip()
+    endpoint = str(value.get("endpoint") or "/chat/completions").strip()
+    if not model or (not base_url and not endpoint.startswith(("http://", "https://"))):
+        return None
+    return RouteConfig(
+        source=source,
+        base_url=base_url,
+        endpoint=endpoint,
+        api_key=str(value.get("api_key") or ""),
+        model=model,
+        timeout=_coerce_timeout(value.get("timeout"), default_timeout),
+    )
+
+
+def _request_error_message(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.URLError):
+        return tr(f"Connection failed: {exc.reason}", f"连接失败：{exc.reason}")
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return tr("Request timed out.", "请求超时。")
+    return str(exc).strip() or exc.__class__.__name__
+
+
+def _source_failure(source: str, exc: Exception) -> str:
+    details = _request_error_message(exc)
+    if source == "local":
+        return tr(f"Local model failed: {details}", f"本地模型失败：{details}")
+    return tr(f"API failed: {details}", f"API 失败：{details}")
+
+
+def _run_route(
+    route: RouteConfig,
+    *,
+    source_text: str,
+    target_lang: str,
+    prompt: str,
+    streaming: bool,
+    disable_thinking_setting: bool,
+) -> None:
+    url = build_url(route.base_url, route.endpoint)
+    deepseek_request = is_deepseek_request(url, route.model)
+    disable_thinking = disable_thinking_setting and deepseek_request
+    headers = {
+        "Accept": "text/event-stream, application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "DankTranslateAI/1.1.0",
+    }
+    if route.api_key:
+        headers["Authorization"] = f"Bearer {route.api_key}"
+
+    payload: dict[str, Any] = {
+        "messages": [
+            {"role": "system", "content": render_prompt(prompt, target_lang)},
+            {"role": "user", "content": source_text},
+        ],
+        "stream": streaming,
+        "model": route.model,
+    }
+    if disable_thinking:
+        payload["thinking"] = {"type": "disabled"}
+
+    emit(
+        "meta",
+        source=route.source,
+        model=route.model,
+        streaming=streaming,
+        thinking_disabled=disable_thinking,
+    )
+    try:
+        has_translation = _request(url, headers, payload, route.timeout, route.source)
+    except ApiResponseError as exc:
+        body_lower = exc.body.lower()
+        if streaming and exc.status in {400, 422} and "stream" in body_lower:
+            payload["stream"] = False
+            emit(
+                "meta",
+                source=route.source,
+                model=route.model,
+                streaming=False,
+                stream_fallback=True,
+            )
+            has_translation = _request(
+                url, headers, payload, route.timeout, route.source
+            )
+        else:
+            raise
+
+    if not has_translation:
+        raise TranslationError(tr("Empty translation.", "译文为空。"))
+
+
+def _legacy_api_route(config: dict[str, Any]) -> RouteConfig | None:
+    """Keep the 1.0 request shape working for scripts and older QML clients."""
+    return _route_from_mapping(
+        "api",
+        {
+            "base_url": config.get("base_url"),
+            "endpoint": config.get("endpoint"),
+            "api_key": config.get("api_key"),
+            "model": config.get("model"),
+            "timeout": config.get("timeout"),
+        },
+        120.0,
+    )
+
+
 def run(config: dict[str, Any]) -> None:
     global _UI_LANGUAGE
     _UI_LANGUAGE = "zh" if str(config.get("ui_language") or "en") == "zh" else "en"
 
-    base_url = str(config.get("base_url") or "")
-    endpoint = str(config.get("endpoint") or "/chat/completions")
-    api_key = str(config.get("api_key") or "")
-    model = str(config.get("model") or "").strip()
     source_text = str(config.get("text") or "").strip()
     target_lang = str(config.get("target_lang") or "Chinese (Simplified)").strip()
     prompt = str(config.get("prompt") or "").strip()
     streaming = bool(config.get("stream", True))
-
-    try:
-        timeout = max(5.0, min(float(config.get("timeout") or 120), 600.0))
-    except (TypeError, ValueError):
-        timeout = 120.0
+    disable_thinking = bool(config.get("disable_thinking", True))
 
     if not source_text:
         raise ConfigError(tr("Selection is empty.", "划词内容为空。"))
@@ -282,50 +411,59 @@ def run(config: dict[str, Any]) -> None:
     if not prompt:
         raise ConfigError(tr("Prompt is empty.", "提示词为空。"))
 
-    url = build_url(base_url, endpoint)
-    deepseek_request = is_deepseek_request(url, model)
-    disable_thinking = bool(config.get("disable_thinking", True)) and deepseek_request
-    headers = {
-        "Accept": "text/event-stream, application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "DankTranslateAI/1.0.2",
-    }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    has_routing_config = "local" in config or "api" in config
+    local_route = _route_from_mapping("local", config.get("local"), 15.0)
+    api_route = _route_from_mapping("api", config.get("api"), 120.0)
+    if not has_routing_config:
+        api_route = _legacy_api_route(config)
 
-    payload: dict[str, Any] = {
-        "messages": [
-            {"role": "system", "content": render_prompt(prompt, target_lang)},
-            {"role": "user", "content": source_text},
-        ],
-        "stream": streaming,
+    allow_remote_fallback = bool(config.get("allow_remote_fallback", True))
+    route_args = {
+        "source_text": source_text,
+        "target_lang": target_lang,
+        "prompt": prompt,
+        "streaming": streaming,
+        "disable_thinking_setting": disable_thinking,
     }
-    if model:
-        payload["model"] = model
-    if disable_thinking:
-        payload["thinking"] = {"type": "disabled"}
 
-    emit(
-        "meta",
-        url=url,
-        model=model,
-        streaming=streaming,
-        thinking_disabled=disable_thinking,
+    if local_route:
+        try:
+            _run_route(local_route, **route_args)
+            emit("done", source="local", model=local_route.model)
+            return
+        except Exception as local_exc:
+            local_failure = _source_failure("local", local_exc)
+            if api_route and allow_remote_fallback:
+                emit(
+                    "fallback",
+                    from_source="local",
+                    to_source="api",
+                    message=local_failure,
+                )
+                try:
+                    _run_route(api_route, **route_args)
+                    emit("done", source="api", model=api_route.model)
+                    return
+                except Exception as api_exc:
+                    raise TranslationError(
+                        local_failure + "\n" + _source_failure("api", api_exc)
+                    ) from api_exc
+            raise TranslationError(local_failure) from local_exc
+
+    if api_route:
+        try:
+            _run_route(api_route, **route_args)
+            emit("done", source="api", model=api_route.model)
+            return
+        except Exception as api_exc:
+            raise TranslationError(_source_failure("api", api_exc)) from api_exc
+
+    raise ConfigError(
+        tr(
+            "Configure a local model or a remote API model.",
+            "请配置本地模型或远程 API 模型。",
+        )
     )
-    try:
-        has_translation = _request(url, headers, payload, timeout)
-    except ApiResponseError as exc:
-        body_lower = exc.body.lower()
-        if streaming and exc.status in {400, 422} and "stream" in body_lower:
-            payload["stream"] = False
-            emit("meta", url=url, model=model, streaming=False, fallback=True)
-            has_translation = _request(url, headers, payload, timeout)
-        else:
-            raise
-
-    if not has_translation:
-        raise RuntimeError(tr("Empty translation.", "译文为空。"))
-    emit("done")
 
 
 def main() -> int:
@@ -341,6 +479,8 @@ def main() -> int:
     except json.JSONDecodeError as exc:
         emit("error", message=tr(f"Invalid request JSON: {exc}", f"请求 JSON 无效：{exc}"))
     except ConfigError as exc:
+        emit("error", message=str(exc))
+    except TranslationError as exc:
         emit("error", message=str(exc))
     except ApiResponseError as exc:
         emit("error", message=str(exc))

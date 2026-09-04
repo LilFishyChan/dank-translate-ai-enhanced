@@ -252,8 +252,14 @@ PluginComponent {
                             StyledText {
                                 width: parent.width
                                 visible: String(entryCard.modelData.model || "").length > 0
-                                text: String(entryCard.modelData.model || "")
+                                    || String(entryCard.modelData.provider || "").length > 0
+                                text: {
+                                    const provider = String(entryCard.modelData.provider || "");
+                                    const model = String(entryCard.modelData.model || "");
+                                    return provider && model ? provider + "  ·  " + model : (provider || model);
+                                }
                                 color: Theme.outlineButton
+                                opacity: 0.68
                                 font.pixelSize: Theme.fontSizeSmall
                                 elide: Text.ElideMiddle
                             }

@@ -12,6 +12,21 @@ PluginSettings {
 
     readonly property bool zh: uiLanguageSetting.value === "zh"
     readonly property string defaultPrompt: "Translate the user's text into ${target_lang}. Preserve meaning, tone, paragraphs, Markdown, code, names, and numbers. Output only the translation."
+
+    function storedValue(key, fallback) {
+        const marker = "__dank_translate_missing__";
+        const value = loadValue(key, marker);
+        return value === marker ? fallback : value;
+    }
+
+    function legacyBaseUrl() {
+        return String(storedValue("baseUrl", ""));
+    }
+
+    function legacyIsLocal() {
+        const url = legacyBaseUrl().trim().toLowerCase();
+        return /^https?:\/\/(localhost|127\.|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(url);
+    }
     readonly property var languageEntries: [
         { label: "简体中文", value: "Chinese (Simplified)" },
         { label: "繁體中文", value: "Chinese (Traditional)" },
@@ -155,42 +170,112 @@ PluginSettings {
 
     StyledText {
         width: parent.width
-        text: root.zh ? "接口" : "API"
+        text: root.zh ? "本地模型（优先）" : "Local model (preferred)"
+        font.pixelSize: Theme.fontSizeLarge
+        font.weight: Font.Bold
+        color: Theme.primary
+    }
+
+    StyledText {
+        width: parent.width
+        text: root.zh
+            ? "填写本地模型 ID 后启用。请求会先发送到本机；本地服务关闭、超时或返回错误时切换到远程 API。"
+            : "Set a local model ID to enable it. Requests go local first, then fall back to the remote API when the local service is offline, times out, or returns an error."
+        font.pixelSize: Theme.fontSizeSmall
+        color: Theme.surfaceVariantText
+        wrapMode: Text.WordWrap
+    }
+
+    StringSetting {
+        settingKey: "localBaseUrl"
+        label: root.zh ? "本地 Base URL" : "Local Base URL"
+        description: root.zh ? "本机或可信局域网内的 OpenAI 兼容地址。" : "OpenAI-compatible endpoint on this device or a trusted LAN."
+        placeholder: "http://127.0.0.1:8080/v1"
+        defaultValue: root.legacyIsLocal() ? root.legacyBaseUrl() : "http://127.0.0.1:8080/v1"
+    }
+
+    StringSetting {
+        settingKey: "localEndpoint"
+        label: root.zh ? "本地 Endpoint" : "Local endpoint"
+        description: root.zh ? "路径或完整 URL。" : "Path or full URL."
+        placeholder: "/chat/completions"
+        defaultValue: root.legacyIsLocal() ? String(root.storedValue("endpoint", "/chat/completions")) : "/chat/completions"
+    }
+
+    StringSetting {
+        settingKey: "localModel"
+        label: root.zh ? "本地模型" : "Local model"
+        description: root.zh ? "留空时直接使用远程 API。" : "Leave empty to use the remote API directly."
+        placeholder: "tencent/Hy-MT2-1.8B-GGUF"
+        defaultValue: root.legacyIsLocal() ? String(root.storedValue("model", "")) : ""
+    }
+
+    SecureStringSetting {
+        settingKey: "localApiKey"
+        label: root.zh ? "本地 API Key" : "Local API Key"
+        description: root.zh ? "多数本地服务可以留空。" : "Most local services accept an empty key."
+        placeholder: root.zh ? "可选" : "Optional"
+        defaultValue: root.legacyIsLocal() ? String(root.storedValue("apiKey", "")) : ""
+    }
+
+    SliderSetting {
+        settingKey: "localTimeoutSeconds"
+        label: root.zh ? "本地超时" : "Local timeout"
+        description: root.zh ? "包含模型冷启动等待时间。" : "Includes model cold-start time."
+        defaultValue: 15
+        minimum: 3
+        maximum: 120
+        unit: root.zh ? "秒" : "s"
+        leftIcon: "timer"
+    }
+
+    ToggleSetting {
+        settingKey: "remoteFallbackEnabled"
+        label: root.zh ? "本地失败后使用远程 API" : "Use remote API after local failure"
+        description: root.zh
+            ? "开启后，发生回退时原文会发送到下面配置的远程接口。"
+            : "When enabled, fallback sends the source text to the remote endpoint configured below."
+        defaultValue: true
+    }
+
+    StyledText {
+        width: parent.width
+        text: root.zh ? "远程 API（回退）" : "Remote API (fallback)"
         font.pixelSize: Theme.fontSizeLarge
         font.weight: Font.Bold
         color: Theme.primary
     }
 
     SecureStringSetting {
-        settingKey: "apiKey"
-        label: "API Key"
-        description: root.zh ? "本地接口可留空。" : "Optional for local APIs."
+        settingKey: "remoteApiKey"
+        label: root.zh ? "远程 API Key" : "Remote API Key"
+        description: root.zh ? "保留现有云端密钥。" : "Your existing cloud API key."
         placeholder: "sk-…"
-        defaultValue: ""
+        defaultValue: root.legacyIsLocal() ? "" : String(root.storedValue("apiKey", ""))
     }
 
     StringSetting {
-        settingKey: "baseUrl"
-        label: "Base URL"
-        description: root.zh ? "OpenAI 兼容地址。" : "OpenAI-compatible URL."
-        placeholder: "http://127.0.0.1:8080/v1"
-        defaultValue: "http://127.0.0.1:8080/v1"
+        settingKey: "remoteBaseUrl"
+        label: root.zh ? "远程 Base URL" : "Remote Base URL"
+        description: root.zh ? "OpenAI 兼容云端地址。" : "OpenAI-compatible cloud URL."
+        placeholder: "https://api.deepseek.com/v1"
+        defaultValue: root.legacyIsLocal() ? "" : root.legacyBaseUrl()
     }
 
     StringSetting {
-        settingKey: "endpoint"
-        label: "Endpoint"
+        settingKey: "remoteEndpoint"
+        label: root.zh ? "远程 Endpoint" : "Remote endpoint"
         description: root.zh ? "路径或完整 URL。" : "Path or full URL."
         placeholder: "/chat/completions"
-        defaultValue: "/chat/completions"
+        defaultValue: root.legacyIsLocal() ? "/chat/completions" : String(root.storedValue("endpoint", "/chat/completions"))
     }
 
     StringSetting {
-        settingKey: "model"
-        label: root.zh ? "模型" : "Model"
-        description: root.zh ? "接口模型 ID。" : "API model ID."
-        placeholder: "tencent/Hy-MT2-1.8B-GGUF"
-        defaultValue: "tencent/Hy-MT2-1.8B-GGUF"
+        settingKey: "remoteModel"
+        label: root.zh ? "远程模型" : "Remote model"
+        description: root.zh ? "远程接口使用的模型 ID。" : "Model ID used by the remote API."
+        placeholder: "deepseek-chat"
+        defaultValue: root.legacyIsLocal() ? "" : String(root.storedValue("model", ""))
     }
 
     ToggleSetting {
@@ -210,9 +295,9 @@ PluginSettings {
     }
 
     SliderSetting {
-        settingKey: "timeoutSeconds"
-        label: root.zh ? "请求超时" : "Timeout"
-        defaultValue: 120
+        settingKey: "remoteTimeoutSeconds"
+        label: root.zh ? "远程请求超时" : "Remote timeout"
+        defaultValue: Number(root.storedValue("timeoutSeconds", 120))
         minimum: 15
         maximum: 600
         unit: root.zh ? "秒" : "s"

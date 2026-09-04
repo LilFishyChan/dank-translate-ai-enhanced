@@ -32,6 +32,9 @@ PluginComponent {
     property string currentStatus: "idle"
     property string currentPhase: "idle"
     property string currentLanguage: "Chinese (Simplified)"
+    property string currentProvider: ""
+    property string currentModel: ""
+    property bool currentUsedFallback: false
     property int inputRequestSerial: 0
     property bool inputBaselineReady: false
     property string lastClipboardEntryId: ""
@@ -190,8 +193,10 @@ PluginComponent {
         globalTranslation.set("");
         globalError.set("");
         currentPhase = "idle";
+        currentProvider = "";
+        currentModel = "";
+        currentUsedFallback = false;
         initialized = true;
-        persistHistory(saved);
         trimHistory();
     }
 
@@ -309,6 +314,9 @@ PluginComponent {
         currentError = String(message || t("Translation failed", "翻译失败"));
         currentStatus = "error";
         currentPhase = "error";
+        currentProvider = "";
+        currentModel = "";
+        currentUsedFallback = false;
         syncCurrentState();
         showPopup();
     }
@@ -510,6 +518,18 @@ PluginComponent {
         return selected;
     }
 
+    function isLikelyLocalUrl(value) {
+        const url = String(value || "").trim().toLowerCase();
+        return /^https?:\/\/(localhost|127\.|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(url);
+    }
+
+    function boundedTimeout(value, fallback, minimum, maximum) {
+        const parsed = Number(value);
+        if (isNaN(parsed))
+            return fallback;
+        return Math.max(minimum, Math.min(maximum, parsed));
+    }
+
     function startTranslation(sourceText) {
         const text = String(sourceText || "").trim();
         if (!text) {
@@ -534,19 +554,63 @@ PluginComponent {
         currentStatus = "running";
         currentPhase = "starting";
         currentLanguage = targetLanguage;
+        currentUsedFallback = false;
+
+        const hasLegacyConfig = pluginData?.baseUrl !== undefined
+            || pluginData?.model !== undefined
+            || pluginData?.apiKey !== undefined;
+        const legacyBaseUrl = hasLegacyConfig ? String(pluginData?.baseUrl ?? "").trim() : "";
+        const legacyEndpoint = String(pluginData?.endpoint ?? "/chat/completions").trim();
+        const legacyApiKey = hasLegacyConfig ? String(pluginData?.apiKey ?? "") : "";
+        const legacyModel = hasLegacyConfig ? String(pluginData?.model ?? "").trim() : "";
+        const legacyLocal = hasLegacyConfig && isLikelyLocalUrl(legacyBaseUrl);
+
+        const localModel = String(pluginData?.localModel ?? (legacyLocal ? legacyModel : "")).trim();
+        const localBaseUrl = String(pluginData?.localBaseUrl ?? (legacyLocal ? legacyBaseUrl : "http://127.0.0.1:8080/v1")).trim();
+        const localEndpoint = String(pluginData?.localEndpoint ?? (legacyLocal ? legacyEndpoint : "/chat/completions")).trim();
+        const localApiKey = String(pluginData?.localApiKey ?? (legacyLocal ? legacyApiKey : ""));
+        const localTimeout = boundedTimeout(pluginData?.localTimeoutSeconds, 15, 3, 120);
+
+        const apiBaseUrl = String(pluginData?.remoteBaseUrl ?? (legacyLocal ? "" : legacyBaseUrl)).trim();
+        const apiEndpoint = String(pluginData?.remoteEndpoint ?? (legacyLocal ? "/chat/completions" : legacyEndpoint)).trim();
+        const apiKey = String(pluginData?.remoteApiKey ?? (legacyLocal ? "" : legacyApiKey));
+        const apiModel = String(pluginData?.remoteModel ?? (legacyLocal ? "" : legacyModel)).trim();
+        const apiTimeout = boundedTimeout(pluginData?.remoteTimeoutSeconds ?? pluginData?.timeoutSeconds, 120, 5, 600);
+
+        const localRoute = localModel ? {
+            base_url: localBaseUrl,
+            endpoint: localEndpoint,
+            api_key: localApiKey,
+            model: localModel,
+            timeout: localTimeout
+        } : {};
+        const apiRoute = {
+            base_url: apiBaseUrl,
+            endpoint: apiEndpoint,
+            api_key: apiKey,
+            model: apiModel,
+            timeout: apiTimeout
+        };
+        const remoteFallbackEnabled = pluginData?.remoteFallbackEnabled ?? true;
+
+        currentProvider = String(localRoute.model || "").trim() ? "local" : "api";
+        currentModel = currentProvider === "local"
+            ? String(localRoute.model || "")
+            : String(apiRoute.model || "");
         syncCurrentState();
         showPopup();
 
         const request = {
-            base_url: String(pluginData?.baseUrl ?? "http://127.0.0.1:8080/v1"),
-            endpoint: String(pluginData?.endpoint ?? "/chat/completions"),
-            api_key: String(pluginData?.apiKey ?? ""),
-            model: String(pluginData?.model ?? "tencent/Hy-MT2-1.8B-GGUF").trim(),
+            local: localRoute,
+            api: apiRoute,
+            allow_remote_fallback: remoteFallbackEnabled,
             target_lang: targetLanguage,
             prompt: String(pluginData?.prompt ?? defaultPrompt),
             stream: pluginData?.streaming ?? true,
             disable_thinking: pluginData?.disableThinking ?? true,
-            timeout: Number(pluginData?.timeoutSeconds ?? 120),
+            timeout_budget: String(localRoute.model || "").trim()
+                ? localTimeout + (remoteFallbackEnabled && String(apiRoute.model || "").trim() ? apiTimeout : 0)
+                : apiTimeout,
             ui_language: uiZh ? "zh" : "en",
             text: text
         };
@@ -556,7 +620,7 @@ PluginComponent {
         });
         activeProcess = process;
         helperStartTimer.restart();
-        requestTimeoutTimer.interval = Math.ceil((request.timeout + 10) * 1000);
+        requestTimeoutTimer.interval = Math.ceil((request.timeout_budget + 10) * 1000);
         requestTimeoutTimer.restart();
         process.running = true;
     }
@@ -577,17 +641,33 @@ PluginComponent {
         case "meta":
             process.requestAccepted = true;
             currentPhase = "waiting";
+            currentProvider = String(event.source || currentProvider);
+            currentModel = String(event.model || currentModel);
             helperStartTimer.stop();
             break;
         case "delta":
             process.requestAccepted = true;
             currentPhase = "streaming";
+            currentProvider = String(event.source || currentProvider);
             helperStartTimer.stop();
             currentTranslation += String(event.text || "");
             globalTranslation.set(currentTranslation);
             break;
+        case "fallback":
+            process.requestAccepted = true;
+            process.usedFallback = true;
+            currentUsedFallback = true;
+            currentTranslation = "";
+            globalTranslation.set("");
+            currentProvider = "api";
+            currentModel = "";
+            currentPhase = "fallback";
+            helperStartTimer.stop();
+            break;
         case "done":
             process.gotDone = true;
+            currentProvider = String(event.source || currentProvider);
+            currentModel = String(event.model || currentModel);
             finishSuccess(process);
             break;
         case "error":
@@ -623,7 +703,7 @@ PluginComponent {
         currentPhase = "done";
         currentError = "";
         syncCurrentState();
-        addHistory(currentOriginal, currentTranslation, currentLanguage);
+        addHistory(currentOriginal, currentTranslation, currentLanguage, currentProvider, currentModel);
     }
 
     function onTranslationExited(process, exitCode) {
@@ -680,24 +760,23 @@ PluginComponent {
         }
     }
 
-    function addHistory(original, translated, language) {
+    function addHistory(original, translated, language, provider, model) {
         const now = Date.now();
         const entry = {
             id: String(now) + "-" + String(Math.floor(Math.random() * 1000000)),
             original: original,
             translated: translated,
             language: language,
-            model: String(pluginData?.model ?? "tencent/Hy-MT2-1.8B-GGUF"),
+            provider: String(provider || ""),
+            model: String(model || ""),
             createdAt: now
         };
         let history = Array.isArray(globalHistory.value) ? globalHistory.value.slice() : [];
-        const duplicate = history.some(item =>
+        history = history.filter(item => !(
             String(item.original || "") === original
                 && String(item.translated || "") === translated
                 && String(item.language || "") === language
-        );
-        if (duplicate)
-            return;
+        ));
         history.unshift(entry);
         history = history.slice(0, historyLimit());
         globalHistory.set(history);
@@ -810,6 +889,7 @@ PluginComponent {
             property bool protocolError: false
             property bool cancelled: false
             property bool requestAccepted: false
+            property bool usedFallback: false
             property string stderrText: ""
             property string protocolNoise: ""
 
@@ -907,6 +987,9 @@ PluginComponent {
                 translation: root.currentTranslation,
                 error: root.currentError,
                 language: root.currentLanguage,
+                provider: root.currentProvider,
+                model: root.currentModel,
+                usedFallback: root.currentUsedFallback,
                 popupVisible: root.popupVisible
             });
         }
@@ -1083,6 +1166,18 @@ PluginComponent {
                 Item {
                     width: parent.width
                     height: 30
+
+                    StyledText {
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: root.currentProvider === "local" || root.currentProvider === "api"
+                        text: root.currentProvider
+                        color: Theme.surfaceVariantText
+                        opacity: 0.52
+                        font.pixelSize: Math.max(9, Theme.fontSizeSmall - 1)
+                        font.weight: Font.Medium
+                        font.letterSpacing: 0.8
+                    }
 
                     Row {
                         anchors.right: parent.right

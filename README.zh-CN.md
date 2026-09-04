@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-面向安全设计的 DankMaterialShell 1.5+ 翻译插件。划词或复制后按一次快捷键，译文会流式显示在顶部中央的紧凑结果卡中，DankBar 同时保存从新到旧排列的翻译历史。
+面向安全设计的 DankMaterialShell 1.6+ 翻译插件。划词或复制后按一次快捷键，译文会流式显示在顶部中央的紧凑结果卡中，DankBar 同时保存从新到旧排列的翻译历史。
 
 ![划词翻译结果卡](docs/translation-popup.png)
 
@@ -17,8 +17,10 @@
 - 连续快捷键会被合并；完全相同的历史记录只保存一条
 - 剪贴板文本进入接口前执行本地敏感信息检测
 - 纯文本 MIME 白名单、文件与 URI 过滤、100,000 字符上限
-- 支持任意 OpenAI 兼容云端接口或本地模型服务
-- 自定义 API Key、Base URL、Endpoint、模型 ID、提示词和目标语言
+- 任意 OpenAI 兼容模型服务的本地优先路由
+- 本地连接、超时、HTTP、流式或空响应失败后自动回退远程 API
+- 独立的本地与远程密钥、地址、模型 ID 和超时
+- 结果弹窗与翻译历史使用弱化小字显示 `local` / `api` 来源
 - 所有 HTTP(S) 接口统一使用 IPv4，支持 SSE 流式响应与完整 JSON 响应
 - 顶部结果卡支持完整文本滚动、停止、关闭和复制
 - DankBar 历史按时间从新到旧保存，支持复制、删除和清空
@@ -53,6 +55,8 @@
 
 剪贴板检测覆盖密码管理器 MIME 标记、密码与密钥字段、私钥、认证头、JWT、常见服务商密钥格式、含凭据的连接地址、PIN、哈希和高熵混合字符串。检测采用偏保守策略，属于尽力而为的安全层。API Key 通过标准输入传给短生命周期适配器，进程参数中仅包含插件路径。
 
+填写本地模型 ID 后启用本地优先路由。本地翻译成功时请求直接结束；本地失败时会先清除已经显示的本地残片，再把原文发送给远程 API。设置页的远程回退开关可以提供严格本地模式。
+
 插件复制译文时会写入一个短期本地标记，下一次快捷键会避开插件自己的输出。
 
 250 毫秒内的连续按键会合并处理。新的 DMS 剪贴板条目或新鲜度窗口内的主选区变更会创建请求。再次复制相同文字也会生成新的条目 ID，因此可以重新翻译。内容完全相同的已完成翻译只占一条历史记录。
@@ -67,11 +71,11 @@ uv run --project /path/to/dankTranslateAI --offline --frozen /path/to/dankTransl
 
 每次选区读取和翻译只创建短生命周期进程。完成、取消或超时后会释放 HTTP 响应、管道与子进程。轻量常驻 `wl-paste` 监听进程负责记录主选区的新鲜度。Python 适配器只在翻译期间运行，并逐行解析流式响应。
 
-标准库 HTTP 适配器通过 IPv4 连接所有云端与本地 HTTP(S) 接口，SSE 分片会持续进入结果卡。DeepSeek 请求可通过“低延迟翻译”设置关闭思考模式，从而缩短首字等待时间。
+标准库 HTTP 适配器通过 IPv4 连接所有云端与本地 HTTP(S) 接口，SSE 分片会持续进入结果卡。DeepSeek 请求可通过“低延迟翻译”设置关闭思考模式，从而缩短首字等待时间。本地与远程尝试共用一个短生命周期进程，回退期间继续沿用同一套取消和超时控制。
 
 依赖：
 
-- DankMaterialShell 1.5+
+- DankMaterialShell 1.6+
 - `uv`
 - `wl-clipboard` 提供的 `wl-paste`
 
@@ -86,7 +90,7 @@ cp -a dank-translate-ai ~/.config/DankMaterialShell/plugins/dankTranslateAI
 随后：
 
 1. 在 DMS 设置 → 插件中扫描并启用 **Dank Translate AI**。
-2. 填写接口参数与目标语言。
+2. 填写本地模型、远程 API 或两者，并选择目标语言。
 3. 把插件加入 DankBar。
 4. 点击“快捷键”右侧键盘图标并按下组合键；`Esc` 取消录入。
 
@@ -123,11 +127,11 @@ dms ipc call dankTranslateAI addToBar right
 dms ipc call dankTranslateAI removeFromBar right
 ```
 
-## 接口配置
+## 本地优先路由
 
-插件发送 OpenAI Chat Completions 请求。设置页保持服务商无关，只填写所选云端接口或本地服务公开的参数。
+插件发送 OpenAI Chat Completions 请求。本地模型配置完成后始终获得第一次尝试；本地失败后远程 API 才接收请求。本地模型留空时直接使用远程 API。
 
-默认本地示例：
+本地示例：
 
 ```text
 Base URL: http://127.0.0.1:8080/v1
@@ -142,6 +146,8 @@ Base URL: https://api.deepseek.com
 Endpoint: /chat/completions
 Model: deepseek-v4-flash
 ```
+
+本地默认超时为 15 秒，其中包含模型冷启动时间。远程回退默认开启，可在设置中关闭。1.0 版本配置会作为兼容默认值读取：回环或私网地址归入本地路由，公网地址归入远程路由。
 
 默认提示词使用 `${target_lang}`。目标语言列表覆盖世界主要地区，同时提供自定义语言字段。
 
