@@ -1,102 +1,127 @@
-# Dank Translate AI
+# Dank Translate AI Enhanced
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-面向安全设计的 DankMaterialShell 1.6+ 翻译插件。划词或复制后按一次快捷键，译文会流式显示在顶部中央的紧凑结果卡中，DankBar 同时保存从新到旧排列的翻译历史。
+面向 DankMaterialShell 1.6+ 的翻译插件，基于 [Dank Translate AI](https://github.com/SakuraToErii/dank-translate-ai) 增强。划词或复制文本后按一次快捷键，译文流式输出到屏幕顶部的紧凑卡片；DankBar 里保存最新优先的翻译历史。
 
-![划词翻译结果卡](docs/translation-popup.png)
+![翻译结果卡](docs/translation-popup.png)
 
 ![DankBar 翻译历史](docs/translation-history.png)
 
-## 主要功能
+## 这个 fork 增加了什么
 
-- 单次原文捕获：按下快捷键后，原文才会进入 QML 与接口请求管线
-- 轻量 `wl-paste --watch` 进程记录主选区的变更时间
-- 最近 60 秒内复制的文本优先；更早的剪贴板内容按空处理
-- 最近 15 秒内发生变化的主选区可以进入翻译
-- 连续快捷键会被合并；完全相同的历史记录只保存一条
-- 剪贴板文本进入接口前执行本地敏感信息检测
-- 纯文本 MIME 白名单、文件与 URI 过滤、100,000 字符上限
-- 任意 OpenAI 兼容模型服务的本地优先路由
-- 本地连接、超时、HTTP、流式或空响应失败后自动回退远程 API
-- 独立的本地与远程密钥、地址、模型 ID 和超时
-- 结果弹窗与翻译历史使用弱化小字显示 `local` / `api` 来源
-- 所有 HTTP(S) 接口统一使用 IPv4，支持 SSE 流式响应与完整 JSON 响应
-- 顶部结果卡支持完整文本滚动、停止、关闭和复制
-- DankBar 历史按时间从新到旧保存，支持复制、删除和清空
-- 设置页支持中英双语、直接录入快捷键和重复检测
+上游是「一个本地模型 + 一个远程 API」的固定结构，卡片只能看和复制。这个 fork 换成了提供商列表，并补齐了卡片操作与提示词配置：
 
-## 与现有翻译插件的定位差异
+**提供商与路由**
 
-三个插件对应不同工作流。[DankTranslate](https://github.com/alcxyz/DankTranslate) 提供基于 `translate-shell` 的 Launcher 快速输入。[Glance Translate](https://github.com/ChaoXu1997/glance) 提供基于 `translate-shell` 的 DankBar 双栏编辑弹窗。Dank Translate AI 聚焦安全的快捷键 AI 翻译、流式输出、服务商无关接口配置和持久翻译历史。
+- 用 `providers` 数组替代本地/远程两个槽位。每项包含名称、Base URL、模型、模型列表、超时和排序。
+- 排序即回退顺序：某个提供商超时或报错时，自动尝试下一个。
+- 每个提供商一个独立 API Key，存放在 `providerKey_<名称>`。
+- 全局默认模型（`提供商 · 模型`）优先于各提供商自己的模型，同时其余提供商仍保留在回退链里。
+- 对所有 OpenAI 兼容后端关闭思考（`chat_template_kwargs` + `reasoning_effort`），服务端不认这两个字段时自动剥离重试。
 
-| 项目 | DankTranslate | Glance Translate | Dank Translate AI |
-|---|---|---|---|
-| 主要流程 | 在 DMS Launcher 中输入触发符与文字 | 打开 DankBar 弹窗读取主选区或手动编辑 | 划词或最近复制后按一次快捷键 |
-| 翻译后端 | `translate-shell` | `translate-shell` 与引擎回退 | 任意 OpenAI 兼容云端或本地模型 |
-| 输出方式 | Launcher 结果 | 原文与译文双栏 | 顶部中央流式结果卡 |
-| 可配置项 | 默认目标语言与语言代码前缀 | 翻译引擎与目标语言 | API Key、Base URL、Endpoint、模型、提示词、流式、超时和广泛语言列表 |
-| 结果保存 | 选择结果后复制 | 原文与译文复制按钮 | DankBar 持久历史，最新结果优先 |
-| 输入处理 | 用户显式输入 Launcher 文本 | 弹窗打开时读取主选区 | 单次时效判断、MIME 过滤、文件过滤、10 万字符上限和本地凭据检测 |
+**提示词模板**
 
-面向审核者的核心定位包括：AI 与本地模型支持、靠近原文上下文的流式结果、DankBar 翻译历史，以及注重隐私的单次输入管线。
+- 变量：`${target_lang}`、`${secondary_lang}`、`${text}`。
+- 支持 `system:` / `user:` 两段式；没有这两个前缀时整段按 system 处理。
+- 可选的 `${secondary_lang}` 变量。默认提示词不引用它——需要副语言时自己写进提示词。
 
-## 输入与安全设计
+**结果卡片**
 
-`translateSelection` 每次调用执行下面的流程：
+- 重试、复制、关闭，流式输出时可中止。
+- 原文与译文同框对照；原文可点击编辑，底部变成 ✓ / ✗，`Ctrl+Enter` 直接重译。
+- 没有原文时显示手动输入框：默认一行，随内容撑高到 160px 后内部滚动。可以从历史弹窗的 `+`、空触发的快捷键、或卡片本身进入。
+- 模型与目标语言下拉框为自实现，固定显示 5 行、垂直滚动——DMS 自带的 `DankDropdown` 在 layer-shell 表面里弹不出来。
+- 长译文在卡片内滚动，每次新翻译时滚动位置归零。
 
-1. 向本地 DMS 查询最新一条剪贴板元数据。
-2. 优先选择最近 60 秒内复制的纯文本。
-3. 查询主选区监听进程维护的变更时间。
-4. 主选区在最近 15 秒内发生变化时，读取当前 Wayland 鼠标主选区。
-5. 两个来源均已过期或为空时提示“请划词或复制文本后再按快捷键”。
+**设置页**
 
-这套逻辑可以读取从 DMS 剪贴板历史重新复制的条目，也适配会把划词内容放进普通剪贴板的应用。常驻监听进程只向 QML 发送变更标记；按下快捷键后才会捕获翻译原文。元数据查询、MIME 检查、大小检查和敏感信息检测均在本地完成，最终选中的原文才会进入所配置的翻译请求。
+- 提供商编辑器：名称、Base URL、掩码显示的 API Key、模型（带「同步」按钮，把 `/v1/models` 拉进下拉框，另有「自定义」项）、超时、排序。
+- 排序冲突时，冲突项及之后的提供商整体后移一位。
+- 已配置的提供商显示在表单上方：第一行名称，第二行 `Base URL · 模型`，右侧「修改」「删除」。
+- 默认模型下拉框的选项由所有 `提供商 · 模型` 组合生成。
 
-剪贴板检测覆盖密码管理器 MIME 标记、密码与密钥字段、私钥、认证头、JWT、常见服务商密钥格式、含凭据的连接地址、PIN、哈希和高熵混合字符串。检测采用偏保守策略，属于尽力而为的安全层。API Key 通过标准输入传给短生命周期适配器，进程参数中仅包含插件路径。
+**历史弹窗**
 
-填写本地模型 ID 后启用本地优先路由。本地翻译成功时请求直接结束；本地失败时会先清除已经显示的本地残片，再把原文发送给远程 API。设置页的远程回退开关可以提供严格本地模式。
-
-插件复制译文时会写入一个短期本地标记，下一次快捷键会避开插件自己的输出。
-
-250 毫秒内的连续按键会合并处理。新的 DMS 剪贴板条目或新鲜度窗口内的主选区变更会创建请求。再次复制相同文字也会生成新的条目 ID，因此可以重新翻译。内容完全相同的已完成翻译只占一条历史记录。
-
-## 运行时与资源占用
-
-插件目录包含 `pyproject.toml` 和 `uv.lock`。QML 直接运行目录内的标准库适配器：
-
-```bash
-uv run --project /path/to/dankTranslateAI --offline --frozen /path/to/dankTranslateAI/translate_stream.py
-```
-
-每次选区读取和翻译只创建短生命周期进程。完成、取消或超时后会释放 HTTP 响应、管道与子进程。轻量常驻 `wl-paste` 监听进程负责记录主选区的新鲜度。Python 适配器只在翻译期间运行，并逐行解析流式响应。
-
-标准库 HTTP 适配器通过 IPv4 连接所有云端与本地 HTTP(S) 接口，SSE 分片会持续进入结果卡。DeepSeek 请求可通过“低延迟翻译”设置关闭思考模式，从而缩短首字等待时间。本地与远程尝试共用一个短生命周期进程，回退期间继续沿用同一套取消和超时控制。
-
-依赖：
-
-- DankMaterialShell 1.6+
-- `uv`
-- `wl-clipboard` 提供的 `wl-paste`
-
-翻译流程支持 DMS 覆盖的任意 Wayland 合成器，因此 Registry 使用 `"compositors": ["any"]` 与 `"distro": ["any"]`。设置页快捷键录入通过 DMS keybind 服务支持 Niri、Hyprland 与 MangoWC；其他合成器可使用下方 IPC 命令。
+- `+` 打开新建翻译，「清空」在其右侧。
+- 空状态显示「手动输入翻译」按钮，不再只是提示文案。
+- 目标语言经语言表转换显示，跟随 DMS 界面语言。
 
 ## 安装
+
+DankMaterialShell 扫描 `~/.config/DankMaterialShell/plugins/<id>/`，插件 `id` 必须保持 `dankTranslateAI`。用软链指向 git 检出目录，方便后续 `git pull` / `git merge`：
+
+```bash
+git clone https://github.com/LilFishyChan/dank-translate-ai-enhanced.git ~/code/dank-translate-ai
+ln -s ~/code/dank-translate-ai ~/.config/DankMaterialShell/plugins/dankTranslateAI
+```
+
+也可以直接复制：
 
 ```bash
 cp -a dank-translate-ai ~/.config/DankMaterialShell/plugins/dankTranslateAI
 ```
 
-随后：
+然后：
 
-1. 在 DMS 设置 → 插件中扫描并启用 **Dank Translate AI**。
-2. 填写本地模型、远程 API 或两者，并选择目标语言。
-3. 把插件加入 DankBar。
-4. 点击“快捷键”右侧键盘图标并按下组合键；`Esc` 取消录入。
+1. 在 DMS 设置 → 插件里扫描并启用 **Dank Translate AI Enhanced**。
+2. 打开插件设置，至少添加一个提供商（名称、Base URL、模型），或点「同步」从 `/v1/models` 拉取模型列表。
+3. 选择默认模型、目标语言，按需设置副语言。
+4. 把插件添加到 DankBar 分区。
+5. 点「快捷键」下的键盘图标录制组合键，`Esc` 取消录制。
+
+依赖：DankMaterialShell 1.6+、`uv`、`wl-clipboard` 提供的 `wl-paste`。
+
+## 提示词模板
+
+默认提示词刻意不带条件分支：
+
+```text
+system: Translate the text provided by the user into ${target_lang}. Preserve the original meaning, tone, paragraph structure, Markdown formatting, code, names, and numbers. Output only the translation.
+user: ${text}
+```
+
+- `${target_lang}` — 设置里选的目标语言。
+- `${secondary_lang}` — 设置里的副语言，默认提示词不引用它。
+- `${text}` — 原文。
+
+条件规则交给用户自己写。部分本地模型会忽略这类条件、照旧译成目标语言，所以默认提示词只保留一个目标语言，跨模型更稳。需要副语言时自己加进提示词，例如：
+
+```text
+- If the text's dominant language is ${target_lang}, translate it into ${secondary_lang} instead.
+```
+
+适配器不做本地语言检测，提示词怎么写，模型就怎么收到。
+
+## 提供商
+
+请求发往任意 OpenAI 兼容的 `/chat/completions` 端点。
+
+```text
+名称:     示例提供商1
+Base URL: http://127.0.0.1:8080/v1
+模型:     示例模型1
+超时:     60
+排序:     1
+```
+
+模型字段可以选同步到的条目，也可以手填模型 ID。同步会把服务端返回的全部模型填进下拉框；自定义留空时保存整个同步列表，并以第一项作为该提供商的默认模型。
+
+密钥保存在 `~/.config/DankMaterialShell/plugin_settings.json` 的 `providerKey_<名称>`。DMS 只是界面上做掩码，文件里是明文，权限建议保持 `600`。
+
+## 输入与安全模型
+
+与上游一致：
+
+- 按快捷键时读取「60 秒内复制的剪贴板内容」或「15 秒内变更的主选区」。
+- 剪贴板文本在发送前本地筛查密码管理器特征、凭据、私钥、令牌和高熵字符串。
+- 仅接受纯文本 MIME，拒绝文件与 URI，上限 10 万字符。
+- 没有可翻译内容时，卡片直接打开手动输入框，不再弹错误。
+- API Key 通过环境变量/标准输入交给 helper，不出现在进程参数里。
 
 ## 快捷键与 IPC
 
-设置页写入下面的动作：
+设置页录制的是这个动作：
 
 ```bash
 dms ipc call dankTranslateAI translateSelection
@@ -105,58 +130,47 @@ dms ipc call dankTranslateAI translateSelection
 Niri 示例：
 
 ```kdl
-Mod+Alt+T repeat=false hotkey-overlay-title="翻译划词或复制" {
+Mod+Alt+T repeat=false hotkey-overlay-title="Translate selection or copy" {
     spawn "dms" "ipc" "call" "dankTranslateAI" "translateSelection";
 }
 ```
 
-其他 IPC：
+其他动作：
 
 ```bash
-# 读取最近 60 秒内复制的普通文本
-dms ipc call dankTranslateAI translateClipboard
-
-# 翻译调用者直接传入的文本
-dms ipc call dankTranslateAI translateText "Hello, world!"
-
+dms ipc call dankTranslateAI translateClipboard          # 翻译最近一次复制
+dms ipc call dankTranslateAI translateText "你好"        # 翻译指定文本
+dms ipc call dankTranslateAI retry                       # 重试上一次请求
+dms ipc call dankTranslateAI status                      # JSON 状态快照
+dms ipc call dankTranslateAI models                      # 可用的 提供商 · 模型
+dms ipc call dankTranslateAI refreshModels               # 从各提供商拉取 /v1/models
+dms ipc call dankTranslateAI translateToLanguage "Japanese"
 dms ipc call dankTranslateAI show
 dms ipc call dankTranslateAI close
 dms ipc call dankTranslateAI cancel
 dms ipc call dankTranslateAI clearHistory
-dms ipc call dankTranslateAI addToBar right
-dms ipc call dankTranslateAI removeFromBar right
 ```
 
-## 本地优先路由
-
-插件发送 OpenAI Chat Completions 请求。本地模型配置完成后始终获得第一次尝试；本地失败后远程 API 才接收请求。本地模型留空时直接使用远程 API。
-
-本地示例：
-
-```text
-Base URL: http://127.0.0.1:8080/v1
-Endpoint: /chat/completions
-Model: tencent/Hy-MT2-1.8B-GGUF
-```
-
-DeepSeek 示例：
-
-```text
-Base URL: https://api.deepseek.com
-Endpoint: /chat/completions
-Model: deepseek-v4-flash
-```
-
-本地默认超时为 15 秒，其中包含模型冷启动时间。远程回退默认开启，可在设置中关闭。1.0 版本配置会作为兼容默认值读取：回环或私网地址归入本地路由，公网地址归入远程路由。
-
-默认提示词使用 `${target_lang}`。目标语言列表覆盖世界主要地区，同时提供自定义语言字段。
-
-## 开发验证
+## 开发
 
 ```bash
-.venv/bin/python -m unittest discover -v
-python -m json.tool plugin.json >/dev/null
+uv run --offline --frozen python -m unittest discover -v
 ```
+
+这个 fork 开发中记下的几点：
+
+- `qmllint`（1.0）对本插件的每个文件都报错且无有效输出，改动用 `dms ipc call plugins reload dankTranslateAI` 配合 `journalctl --user -u dms.service` 验证。
+- 手改 `plugin_settings.json` 后必须 `systemctl --user restart dms.service`；`plugins reload` 只重载 QML，不重读设置。
+- 软链部署的插件目录里，共享 `.js` 文件与同目录 QML 类型都无法解析——helper 要么内联，要么放 Python 侧。
+
+## 上游同步
+
+```bash
+git remote add upstream https://github.com/SakuraToErii/dank-translate-ai.git   # 只需一次
+git fetch upstream && git merge upstream/master
+```
+
+本仓库保留了上游历史，合并不会冲突堆积；fork 自身的改动压在上游基线之上的单个提交里。
 
 ## 许可证
 

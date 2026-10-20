@@ -1,87 +1,62 @@
-# Dank Translate AI
+# Dank Translate AI Enhanced
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A security-focused DankMaterialShell 1.6+ translation plugin. Press one shortcut after selecting or copying text; translation streams into a compact top-center card, while DankBar keeps a persistent newest-first history.
+An enhanced fork of [Dank Translate AI](https://github.com/SakuraToErii/dank-translate-ai) for DankMaterialShell 1.6+. Press one shortcut after selecting or copying text and the translation streams into a compact top-center card; DankBar keeps a persistent newest-first history.
 
-![Selection translation overlay](docs/translation-popup.png)
+![Translation result card](docs/translation-popup.png)
 
 ![DankBar translation history](docs/translation-history.png)
 
-## Highlights
+## What this fork adds
 
-- One-shot text capture: source text enters QML and the API pipeline after the shortcut is pressed
-- A lightweight `wl-paste --watch` process records primary-selection change times
-- Text copied within the last 60 seconds takes priority; older clipboard content is treated as empty
-- A primary selection changed within the last 15 seconds is eligible for translation
-- Repeated shortcuts are coalesced, and exact duplicate history entries are stored once
-- Local best-effort secret screening before clipboard text reaches an API
-- Plain-text MIME allowlist, file/URI rejection, and a 100,000-character limit
-- Local-first routing for any OpenAI-compatible model server
-- Automatic remote API fallback after local connection, timeout, HTTP, stream, or empty-response failures
-- Separate local and remote credentials, endpoints, model IDs, and timeouts
-- A muted `local` / `api` source label in the result card and translation history
-- IPv4 transport for every HTTP(S) API, with SSE streaming and complete JSON response support
-- Compact persistent result card with scrolling and stop, close, and copy actions
-- Newest-first DankBar history with copy, delete, and clear actions
-- English/Chinese settings and direct shortcut recording with conflict detection
+The upstream plugin talks to one local model and one remote API, shows a streaming card and keeps a history. This fork replaces that with a provider model, adds card-level controls and a configurable prompt:
 
-## Why another translation plugin?
+**Providers and routing**
 
-The three plugins serve different workflows. [DankTranslate](https://github.com/alcxyz/DankTranslate) is a fast launcher command powered by `translate-shell`. [Glance Translate](https://github.com/ChaoXu1997/glance) is an editable side-by-side bar popout powered by `translate-shell`. Dank Translate AI focuses on secure, shortcut-driven AI translation, streaming output, provider-independent API configuration, and persistent translation history.
+- A `providers` list instead of separate local/remote slots. Each entry has a name, base URL, model, model list, timeout and sort order.
+- Sort order **is** the fallback priority: when a provider times out or fails, the next one is tried automatically.
+- Per-provider API keys, stored as `providerKey_<name>`.
+- A global default model (`provider · model`) that takes priority over each provider's own model — without dropping the remaining providers from the fallback chain.
+- Thinking is disabled for every OpenAI-compatible backend (`chat_template_kwargs` + `reasoning_effort`), with a retry that strips those fields if a server rejects them.
 
-| Area | DankTranslate | Glance Translate | Dank Translate AI |
-|---|---|---|---|
-| Main workflow | Type into DMS Launcher with a trigger | Open a DankBar popout for the primary selection or manual editing | Select or recently copy text, then press one shortcut |
-| Backend | `translate-shell` | `translate-shell` with engine fallback | Any OpenAI-compatible cloud or local model |
-| Output | Launcher result | Side-by-side source and result | Streaming top-center result card |
-| Configuration | Default target and language-code prefix | Engine and target language | API Key, Base URL, endpoint, model, prompt, streaming, timeout, and broad target list |
-| Saved results | Select a result to copy it | Source/result copy buttons | Persistent newest-first translation history in DankBar |
-| Input handling | Explicit launcher text | Primary selection read when the popout opens | One-shot freshness check, MIME filtering, file rejection, 100k limit, and local clipboard secret screening |
+**Prompt template**
 
-This scope gives reviewers a clear distinction: AI and local-model support, streaming near the source context, a translation-history widget, and a privacy-oriented one-shot input pipeline.
+- `${target_lang}`, `${secondary_lang}` and `${text}` placeholders.
+- `system:` / `user:` sections; a prompt without those prefixes is still treated as a system-only prompt.
+- An optional `${secondary_lang}` variable. The default prompt does not reference it — add the rule yourself if you want a fallback language.
 
-## Input and security model
+**Result card**
 
-`translateSelection` performs this sequence when invoked:
+- Retry, copy, close, and stop while streaming.
+- Source and translation shown together; the source is editable — click it, edit, then confirm (✓) or cancel (✗), `Ctrl+Enter` re-translates.
+- Manual input when there is no source text: a one-row box that grows with the content up to 160 px and then scrolls. Reachable from the history popup's `+`, from a shortcut press with nothing to translate, or from the card itself.
+- Self-made dropdowns for model and target language, fixed to a 5-row window with vertical scrolling — DMS's own `DankDropdown` cannot render inside a layer-shell surface.
+- Long translations scroll inside the card, and the scroll position resets on every new translation.
 
-1. Query one local DMS clipboard metadata entry.
-2. Prefer plain text copied during the last 60 seconds.
-3. Check the change timestamp maintained by the primary-selection watcher.
-4. Read the current Wayland primary selection when it changed during the last 15 seconds.
-5. Show “Select or copy text first” when both sources are stale or empty.
+**Settings page**
 
-This supports text copied from DMS Clipboard History and apps that place selected text on the regular clipboard. The resident watcher sends change markers to QML; source text is captured for translation after the shortcut. The metadata query, MIME checks, size checks, and secret scan stay local. Only the chosen source text enters the configured translation request.
+- Provider editor with name, base URL, masked API key, model (plus a sync button that pulls `/v1/models` into a dropdown with a Custom entry), timeout and sort order.
+- Sort conflicts shift the conflicting and following providers down one slot.
+- Configured providers are listed above the form as `name` over `baseUrl · model`, with edit and delete actions.
+- Default model selector built from every `provider · model` pair.
 
-Clipboard screening recognizes password-manager MIME hints, credential labels, private keys, authorization headers, JWTs, common provider key formats, credential-bearing connection URLs, PIN-like values, hashes, and high-entropy mixed strings. Detection is intentionally conservative and remains a best-effort safety layer. API keys are passed to the short-lived adapter through standard input and stay out of process arguments.
+**History popup**
 
-Setting a local model ID enables local-first routing. A successful local response completes entirely on the local route. A local failure clears any partial local output before the adapter sends the source text to the configured remote API. The remote-fallback toggle provides a strict-local mode for sensitive workflows.
-
-Copies made by the plugin carry a short local marker, so the next shortcut avoids selecting the plugin's own output as a fresh input.
-
-Shortcut presses within 250 ms are coalesced. A new DMS clipboard entry or a primary-selection change within the freshness window starts a request. Copying identical text again still counts as a new copy. Exact duplicate completed translations occupy one history entry.
-
-## Runtime and resource use
-
-The plugin contains `pyproject.toml` and `uv.lock`. QML runs the standard-library adapter directly from the plugin directory:
-
-```bash
-uv run --project /path/to/dankTranslateAI --offline --frozen /path/to/dankTranslateAI/translate_stream.py
-```
-
-Each input capture and translation uses a short-lived process. Completion, cancellation, and timeout release HTTP responses, pipes, and child processes. A lightweight resident `wl-paste` watcher tracks primary-selection freshness. The Python adapter runs only during a translation and parses streaming responses line by line.
-
-The standard-library HTTP adapter resolves every cloud and local HTTP(S) API connection through IPv4. SSE response chunks continue directly into the result card. DeepSeek requests can disable thinking mode through the low-latency setting to reduce time to first token. Local and remote attempts share one helper process, so fallback preserves cancellation and timeout ownership.
-
-Requirements:
-
-- DankMaterialShell 1.6+
-- `uv`
-- `wl-paste` from `wl-clipboard`
-
-The workflow supports any Wayland compositor supported by DMS. Registry metadata uses `"compositors": ["any"]` and `"distro": ["any"]`. Direct shortcut recording supports Niri, Hyprland, and MangoWC through the DMS keybind service; other compositors can use the IPC command below.
+- `+` opens a new translation, clear sits to its right.
+- Empty state offers a "type text to translate" button instead of an instruction line.
+- Target language is rendered through the language table, so it follows the DMS locale.
 
 ## Install
+
+DankMaterialShell scans `~/.config/DankMaterialShell/plugins/<id>/` and expects the plugin `id` to stay `dankTranslateAI`. Installing from a git checkout with a symlink keeps `git pull` / `git merge` working:
+
+```bash
+git clone https://github.com/LilFishyChan/dank-translate-ai-enhanced.git ~/code/dank-translate-ai
+ln -s ~/code/dank-translate-ai ~/.config/DankMaterialShell/plugins/dankTranslateAI
+```
+
+Or copy it in place:
 
 ```bash
 cp -a dank-translate-ai ~/.config/DankMaterialShell/plugins/dankTranslateAI
@@ -89,10 +64,60 @@ cp -a dank-translate-ai ~/.config/DankMaterialShell/plugins/dankTranslateAI
 
 Then:
 
-1. Scan and enable **Dank Translate AI** in DMS Settings → Plugins.
-2. Enter a local model, a remote API, or both, then choose the target language.
-3. Add the plugin to a DankBar section.
-4. Click the keyboard icon under Shortcut and press a key combination. `Esc` cancels recording.
+1. Scan and enable **Dank Translate AI Enhanced** in DMS Settings → Plugins.
+2. Open the plugin settings, add at least one provider (name, base URL, model), or press Sync to load the model list from `/v1/models`.
+3. Pick a default model, a target language and optionally a fallback language.
+4. Add the plugin to a DankBar section.
+5. Click the keyboard icon under Shortcut and press a key combination. `Esc` cancels recording.
+
+Requirements: DankMaterialShell 1.6+, `uv`, and `wl-paste` from `wl-clipboard`.
+
+## Prompt template
+
+The default prompt is deliberately unconditional:
+
+```text
+system: Translate the text provided by the user into ${target_lang}. Preserve the original meaning, tone, paragraph structure, Markdown formatting, code, names, and numbers. Output only the translation.
+user: ${text}
+```
+
+- `${target_lang}` — the language picked in settings.
+- `${secondary_lang}` — the fallback language from settings. The default prompt does not reference it.
+- `${text}` — the source text.
+
+Conditional rules are left to the user. Some local models ignore them and translate into the target language anyway, so the default keeps a single target and stays accurate across models. When you want a fallback language, write it into the prompt yourself, for example:
+
+```text
+- If the text's dominant language is ${target_lang}, translate it into ${secondary_lang} instead.
+```
+
+The adapter does not detect languages itself; whatever the prompt says is what the model gets.
+
+## Providers
+
+Requests go to any OpenAI-compatible `/chat/completions` endpoint.
+
+```text
+Name:      provider-one
+Base URL:  http://127.0.0.1:8080/v1
+Model:     model-one
+Timeout:   60
+Sort:      1
+```
+
+The model field accepts a synced entry or a custom model ID. Sync fills the dropdown with everything the server reports; leaving the custom field empty saves the whole synced list and uses its first entry as the provider default.
+
+Keys are stored in `~/.config/DankMaterialShell/plugin_settings.json` as `providerKey_<name>`. DMS only masks them in the UI — the file is plain text, so keep its permissions at `600`.
+
+## Input and security model
+
+Unchanged from upstream:
+
+- A shortcut press reads either a clipboard entry copied within the last 60 seconds or a primary selection changed within the last 15 seconds.
+- Clipboard text is screened locally for password-manager hints, credentials, private keys, tokens and high-entropy strings before anything is sent.
+- Plain-text MIME only, no files or URIs, 100,000-character limit.
+- When there is nothing to translate, the card opens with the manual input box instead of an error.
+- API keys reach the helper through the environment / stdin, never through process arguments.
 
 ## Shortcut and IPC
 
@@ -110,53 +135,42 @@ Mod+Alt+T repeat=false hotkey-overlay-title="Translate selection or copy" {
 }
 ```
 
-Other IPC actions:
+Other actions:
 
 ```bash
-# Require a regular text copy from the last 60 seconds
-dms ipc call dankTranslateAI translateClipboard
-
-# Translate caller-supplied text
-dms ipc call dankTranslateAI translateText "Hello, world!"
-
+dms ipc call dankTranslateAI translateClipboard          # translate a recent copy
+dms ipc call dankTranslateAI translateText "Hello!"      # translate caller-supplied text
+dms ipc call dankTranslateAI retry                       # retry the last request
+dms ipc call dankTranslateAI status                      # JSON state snapshot
+dms ipc call dankTranslateAI models                      # available provider · model targets
+dms ipc call dankTranslateAI refreshModels               # pull /v1/models from every provider
+dms ipc call dankTranslateAI translateToLanguage "Japanese"
 dms ipc call dankTranslateAI show
 dms ipc call dankTranslateAI close
 dms ipc call dankTranslateAI cancel
 dms ipc call dankTranslateAI clearHistory
-dms ipc call dankTranslateAI addToBar right
-dms ipc call dankTranslateAI removeFromBar right
 ```
-
-## Local-first routing
-
-The plugin sends OpenAI Chat Completions requests. A configured local model always receives the first attempt. The remote API receives the request only after a local failure. Leaving the local model empty routes directly to the API.
-
-Local example:
-
-```text
-Base URL: http://127.0.0.1:8080/v1
-Endpoint: /chat/completions
-Model: tencent/Hy-MT2-1.8B-GGUF
-```
-
-DeepSeek example:
-
-```text
-Base URL: https://api.deepseek.com
-Endpoint: /chat/completions
-Model: deepseek-v4-flash
-```
-
-The default local timeout is 15 seconds and includes model cold-start time. Remote fallback is enabled by default and can be disabled in settings. Version 1.0 settings are read as compatibility defaults: loopback/private endpoints become the local route, while public endpoints become the remote route.
-
-The default prompt uses `${target_lang}`. Settings include common languages covering most regions plus a custom target field.
 
 ## Development
 
 ```bash
-.venv/bin/python -m unittest discover -v
-python -m json.tool plugin.json >/dev/null
+uv run --offline --frozen python -m unittest discover -v
 ```
+
+Notes collected while working on this fork:
+
+- `qmllint` (1.0) rejects every file in this plugin and prints nothing useful — verify changes with `dms ipc call plugins reload dankTranslateAI` plus `journalctl --user -u dms.service`.
+- Editing `plugin_settings.json` by hand needs `systemctl --user restart dms.service`; `plugins reload` only reloads QML and does not reread settings.
+- Shared `.js` files and sibling QML types do not resolve inside a symlinked plugin directory — keep helpers inline or as Python.
+
+## Upstream
+
+```bash
+git remote add upstream https://github.com/SakuraToErii/dank-translate-ai.git   # once
+git fetch upstream && git merge upstream/master
+```
+
+The upstream history is preserved in this repository, so merges stay straightforward. The fork's own work is squashed into a single commit on top of the upstream baseline.
 
 ## License
 
