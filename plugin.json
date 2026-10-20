@@ -1,9 +1,9 @@
 {
   "$schema": "https://danklinux.com/schemas/plugin.json",
   "id": "dankTranslateAI",
-  "name": "Dank Translate AI",
-  "description": "Local-first AI translation with automatic API fallback, streaming results, source labels, and DankBar history",
-  "version": "1.1.0",
+  "name": "Dank Translate AI Enhanced",
+  "description": "Fork of Dank Translate AI with multi-provider routing, ordered fallback, per-provider keys, provider·model and language dropdowns, retry, editable source, and thinking control for OpenAI-compatible backends",
+  "version": "1.1.1",
   "author": "Ordis",
   "type": "composite",
   "capabilities": [

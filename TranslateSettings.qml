@@ -5,18 +5,323 @@ import Quickshell
 import qs.Common
 import qs.Widgets
 import qs.Modules.Plugins
+import qs.Services
+import Quickshell.Io
 
 PluginSettings {
     id: root
     pluginId: "dankTranslateAI"
 
-    readonly property bool zh: uiLanguageSetting.value === "zh"
-    readonly property string defaultPrompt: "Translate the user's text into ${target_lang}. Preserve meaning, tone, paragraphs, Markdown, code, names, and numbers. Output only the translation."
+    readonly property string dmsLocale: {
+        const raw = String(SessionData.locale || "");
+        return raw === "" ? String(Qt.locale().name) : raw;
+    }
+    readonly property bool zh: dmsLocale.toLowerCase().indexOf("zh") === 0
+    readonly property string defaultPrompt: "system: Translate the text provided by the user into ${target_lang}. Preserve the original meaning, tone, paragraph structure, Markdown formatting, code, names, and numbers. Output only the translation.\nuser: ${text}"
 
     function storedValue(key, fallback) {
         const marker = "__dank_translate_missing__";
         const value = loadValue(key, marker);
         return value === marker ? fallback : value;
+    }
+
+    // ---------- 提供商编辑器状态 ----------
+    readonly property string pluginDir: String(Quickshell.env("HOME")) + "/.config/DankMaterialShell/plugins/dankTranslateAI"
+    property var providerList: []
+    property int providerEditingIndex: -1
+    property var providerModels: []
+    property string draftModel: ""
+    property string providerStatus: ""
+    property bool providerBusy: false
+    property bool providerDropdownReady: false
+
+    readonly property string customModelLabel: zh ? "自定义" : "Custom"
+
+    function providerModelChoices() {
+        const list = [];
+        for (let i = 0; i < providerModels.length; i++)
+            list.push(String(providerModels[i]));
+        list.push(customModelLabel);
+        return list;
+    }
+
+    function refreshProviderList() {
+        const raw = storedValue("providers", []);
+        const list = Array.isArray(raw) ? raw.slice() : [];
+        list.sort((a, b) => Number(a && a.sort ? a.sort : 999) - Number(b && b.sort ? b.sort : 999));
+        providerList = list;
+    }
+
+    function defaultTargetOptions() {
+        const list = [];
+        const entries = providerList;
+        for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i] || {};
+            const name = String(entry.name || "");
+            if (!name)
+                continue;
+            const models = Array.isArray(entry.models) && entry.models.length > 0
+                ? entry.models
+                : [String(entry.model || "")];
+            for (let m = 0; m < models.length; m++) {
+                const model = String(models[m] || "").trim();
+                if (model)
+                    list.push({ label: name + " · " + model, value: name + " · " + model });
+            }
+        }
+        return list;
+    }
+
+    function resetProviderDraft() {
+        providerEditingIndex = -1;
+        if (nameField) nameField.text = "";
+        if (baseField) baseField.text = "";
+        if (keyField) keyField.text = "";
+        if (customModelField) customModelField.text = "";
+        if (timeoutField) timeoutField.text = "60";
+        if (sortField) sortField.text = String(providerList.length + 1);
+        providerModels = [];
+        draftModel = "";
+        providerStatus = "";
+    }
+
+    function editProvider(index) {
+        const item = providerList[index];
+        if (!item)
+            return;
+        providerEditingIndex = index;
+        nameField.text = String(item.name || "");
+        baseField.text = String(item.baseUrl || "");
+        keyField.text = String(loadValue("providerKey_" + String(item.name || ""), "") || "");
+        const existingModels = [];
+        if (Array.isArray(item.models)) {
+            for (let i = 0; i < item.models.length; i++) {
+                const candidate = String(item.models[i] || "").trim();
+                if (candidate.length > 0 && existingModels.indexOf(candidate) < 0)
+                    existingModels.push(candidate);
+            }
+        }
+        const currentModel = String(item.model || "");
+        if (currentModel.length > 0 && existingModels.indexOf(currentModel) < 0)
+            existingModels.unshift(currentModel);
+        providerModels = existingModels;
+        draftModel = currentModel;
+        customModelField.text = "";
+        timeoutField.text = String(item.timeout || "60");
+        sortField.text = String(item.sort || (index + 1));
+        providerStatus = root.zh ? "正在修改 " + String(item.name || "") : "Editing " + String(item.name || "");
+    }
+
+    function deleteProvider(index) {
+        const list = providerList.slice();
+        const removed = list.splice(index, 1);
+        saveValue("providers", list);
+        refreshProviderList();
+        providerStatus = removed.length > 0
+            ? (root.zh ? "已删除 " + String(removed[0].name || "") : "Deleted " + String(removed[0].name || ""))
+            : "";
+        if (providerEditingIndex >= 0)
+            resetProviderDraft();
+    }
+
+    function saveProvider() {
+        const name = String(nameField.text || "").trim();
+        const baseUrl = String(baseField.text || "").trim();
+        const apiKey = String(keyField.text || "");
+        let models = providerModels.slice();
+        let model = String(draftModel || "").trim();
+        if (model === customModelLabel) {
+            const custom = String(customModelField.text || "").trim();
+            if (custom.length > 0) {
+                model = custom;
+                if (models.indexOf(custom) < 0)
+                    models.push(custom);
+            } else {
+                // 自定义留空：保存同步到的全部模型，默认取第一个
+                model = models.length > 0 ? String(models[0]) : "";
+            }
+        } else if (model.length === 0) {
+            // 没手动选：默认取同步列表的第一个
+            model = models.length > 0 ? String(models[0]) : "";
+        }
+        if (model.length > 0 && models.indexOf(model) < 0)
+            models.unshift(model);
+        const timeout = String(timeoutField.text || "").trim() || "60";
+        if (!name || !baseUrl || models.length === 0) {
+            providerStatus = root.zh
+                ? "名称、Base URL 不能为空，且至少需要一个模型（点「同步」获取，或选「自定义」填写）"
+                : "Name and Base URL are required, and at least one model is needed (Sync or Custom)";
+            return;
+        }
+        let sort = parseInt(String(sortField.text || "").trim(), 10);
+        if (isNaN(sort) || sort < 1)
+            sort = providerList.length + 1;
+
+        let list = providerList.slice();
+        if (providerEditingIndex >= 0)
+            list.splice(providerEditingIndex, 1);
+
+        // 同排序冲突：>= sort 的往后移一位（保持插入语义）
+        for (let i = 0; i < list.length; i++) {
+            const current = Number(list[i].sort || 0);
+            if (current >= sort)
+                list[i] = Object.assign({}, list[i], { sort: current + 1 });
+        }
+
+        list.push({
+            name: name,
+            baseUrl: baseUrl,
+            model: model,
+            models: models,
+            timeout: timeout,
+            sort: sort
+        });
+        list.sort((a, b) => Number(a.sort || 999) - Number(b.sort || 999));
+
+        saveValue("providers", list);
+        saveValue("providerKey_" + name, apiKey);
+        refreshProviderList();
+        const savedName = name;
+        resetProviderDraft();
+        providerStatus = root.zh ? "已保存 " + savedName : "Saved " + savedName;
+    }
+
+    function syncProviderModels() {
+        if (providerBusy)
+            return;
+        const base = String(baseField.text || "").trim();
+        if (!base) {
+            providerStatus = root.zh ? "先填 Base URL" : "Fill in the Base URL first";
+            return;
+        }
+        providerBusy = true;
+        providerStatus = root.zh ? "正在拉取模型列表…" : "Fetching models…";
+        providerModels = [];
+        const proc = syncComponent.createObject(root, {
+            "targetBase": base,
+            "targetKey": String(keyField.text || "")
+        });
+        if (!proc) {
+            providerBusy = false;
+            providerStatus = root.zh ? "无法启动获取进程" : "Could not start the fetch helper";
+            return;
+        }
+        syncProcess = proc;
+        proc.running = true;
+    }
+
+    function applyProviderModel(model) {
+        draftModel = String(model || "");
+        providerStatus = root.zh ? "已选择 " + String(model || "") : "Selected " + String(model || "");
+    }
+
+    property var syncProcess: null
+
+    Component {
+        id: syncComponent
+
+        Process {
+            id: syncProc
+            property string targetBase: ""
+            property string targetKey: ""
+            property string buffer: ""
+
+            environment: ({
+                "UV_NO_PROGRESS": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONUNBUFFERED": "1",
+                "DTAI_BASE_URL": syncProc.targetBase,
+                "DTAI_API_KEY": syncProc.targetKey
+            })
+
+            command: [
+                "uv", "run",
+                "--project", root.pluginDir,
+                "--offline",
+                "--frozen",
+                root.pluginDir + "/list_models.py"
+            ]
+
+            stdout: StdioCollector {
+                onStreamFinished: syncProc.buffer = text
+            }
+
+            stderr: StdioCollector {}
+
+            onExited: (exitCode, exitStatus) => {
+                Qt.callLater(() => {
+                    root.providerBusy = false;
+                    let parsed = null;
+                    try {
+                        parsed = JSON.parse(String(syncProc.buffer || "").trim());
+                    } catch (e) {
+                        parsed = null;
+                    }
+                    if (parsed && Array.isArray(parsed.models) && parsed.models.length > 0) {
+                        root.providerModels = parsed.models;
+                        if (root.providerModels.indexOf(root.draftModel) < 0)
+                            root.draftModel = String(parsed.models[0] || "");
+                        root.providerStatus = root.zh
+                            ? "获取到 " + parsed.models.length + " 个模型"
+                            : parsed.models.length + " models fetched";
+                    } else {
+                        root.providerStatus = parsed && parsed.error
+                            ? String(parsed.error)
+                            : (root.zh ? "获取模型失败" : "Failed to fetch models");
+                    }
+                    syncProc.destroy();
+                });
+            }
+        }
+    }
+
+    onPluginServiceChanged: Qt.callLater(reloadProvidersFromService)
+
+    Connections {
+        target: pluginService
+        enabled: pluginService !== null
+
+        function onPluginDataChanged(changedPluginId) {
+            if (changedPluginId === pluginId)
+                Qt.callLater(reloadProvidersFromService);
+        }
+    }
+
+    function reloadProvidersFromService() {
+        migrateLegacyProviders();
+        refreshProviderList();
+        providerDropdownReady = true;
+        if (sortField && String(sortField.text || "").trim() === "")
+            sortField.text = String(providerList.length + 1);
+    }
+
+    Component.onCompleted: Qt.callLater(reloadProvidersFromService)
+
+    function migrateLegacyProviders() {
+        const existing = storedValue("providers", []);
+        if (Array.isArray(existing) && existing.length > 0)
+            return;
+        const list = [];
+        const localModel = String(storedValue("localModel", "") || "").trim();
+        if (localModel.length > 0) {
+            list.push({
+                name: "local",
+                baseUrl: String(storedValue("localBaseUrl", "") || "http://127.0.0.1:8080/v1"),
+                model: localModel,
+                timeout: String(storedValue("localTimeoutSeconds", 15))
+            });
+        }
+        const remoteModel = String(storedValue("remoteModel", "") || "").trim();
+        if (remoteModel.length > 0) {
+            list.push({
+                name: "remote",
+                baseUrl: String(storedValue("remoteBaseUrl", "") || ""),
+                model: remoteModel,
+                timeout: String(storedValue("remoteTimeoutSeconds", 120))
+            });
+        }
+        if (list.length > 0)
+            saveValue("providers", list);
     }
 
     function legacyBaseUrl() {
@@ -124,6 +429,7 @@ PluginSettings {
         { label: "毛利语", value: "Maori" },
         { label: "萨摩亚语", value: "Samoan" },
         { label: "自定义语言", value: "__custom__" }
+    
     ]
     readonly property var languages: {
         const result = [];
@@ -143,7 +449,7 @@ PluginSettings {
 
         StyledText {
             width: parent.width
-            text: "Dank Translate AI"
+            text: "Dank Translate AI Enhanced"
             font.pixelSize: Theme.fontSizeLarge + 2
             font.weight: Font.Bold
             color: Theme.surfaceText
@@ -157,20 +463,9 @@ PluginSettings {
         wrapMode: Text.WordWrap
     }
 
-    SelectionSetting {
-        id: uiLanguageSetting
-        settingKey: "uiLanguage"
-        label: root.zh ? "界面语言" : "UI language"
-        options: [
-            { label: "English", value: "en" },
-            { label: "中文", value: "zh" }
-        ]
-        defaultValue: "en"
-    }
-
     StyledText {
         width: parent.width
-        text: root.zh ? "本地模型（优先）" : "Local model (preferred)"
+        text: root.zh ? "提供商" : "Providers"
         font.pixelSize: Theme.fontSizeLarge
         font.weight: Font.Bold
         color: Theme.primary
@@ -179,103 +474,272 @@ PluginSettings {
     StyledText {
         width: parent.width
         text: root.zh
-            ? "填写本地模型 ID 后启用。请求会先发送到本机；本地服务关闭、超时或返回错误时切换到远程 API。"
-            : "Set a local model ID to enable it. Requests go local first, then fall back to the remote API when the local service is offline, times out, or returns an error."
+            ? "按列表顺序依次尝试，前一个超时或报错时自动切换到下一个。超时单位：秒。Endpoint 固定为 /chat/completions。"
+            : "Tried in order; when one times out or errors the next is used. Timeout in seconds. Endpoint is fixed to /chat/completions."
         font.pixelSize: Theme.fontSizeSmall
         color: Theme.surfaceVariantText
         wrapMode: Text.WordWrap
     }
 
-    StringSetting {
-        settingKey: "localBaseUrl"
-        label: root.zh ? "本地 Base URL" : "Local Base URL"
-        description: root.zh ? "本机或可信局域网内的 OpenAI 兼容地址。" : "OpenAI-compatible endpoint on this device or a trusted LAN."
-        placeholder: "http://127.0.0.1:8080/v1"
-        defaultValue: root.legacyIsLocal() ? root.legacyBaseUrl() : "http://127.0.0.1:8080/v1"
-    }
-
-    StringSetting {
-        settingKey: "localEndpoint"
-        label: root.zh ? "本地 Endpoint" : "Local endpoint"
-        description: root.zh ? "路径或完整 URL。" : "Path or full URL."
-        placeholder: "/chat/completions"
-        defaultValue: root.legacyIsLocal() ? String(root.storedValue("endpoint", "/chat/completions")) : "/chat/completions"
-    }
-
-    StringSetting {
-        settingKey: "localModel"
-        label: root.zh ? "本地模型" : "Local model"
-        description: root.zh ? "留空时直接使用远程 API。" : "Leave empty to use the remote API directly."
-        placeholder: "tencent/Hy-MT2-1.8B-GGUF"
-        defaultValue: root.legacyIsLocal() ? String(root.storedValue("model", "")) : ""
-    }
-
-    SecureStringSetting {
-        settingKey: "localApiKey"
-        label: root.zh ? "本地 API Key" : "Local API Key"
-        description: root.zh ? "多数本地服务可以留空。" : "Most local services accept an empty key."
-        placeholder: root.zh ? "可选" : "Optional"
-        defaultValue: root.legacyIsLocal() ? String(root.storedValue("apiKey", "")) : ""
-    }
-
-    SliderSetting {
-        settingKey: "localTimeoutSeconds"
-        label: root.zh ? "本地超时" : "Local timeout"
-        description: root.zh ? "包含模型冷启动等待时间。" : "Includes model cold-start time."
-        defaultValue: 15
-        minimum: 3
-        maximum: 120
-        unit: root.zh ? "秒" : "s"
-        leftIcon: "timer"
-    }
-
-    ToggleSetting {
-        settingKey: "remoteFallbackEnabled"
-        label: root.zh ? "本地失败后使用远程 API" : "Use remote API after local failure"
-        description: root.zh
-            ? "开启后，发生回退时原文会发送到下面配置的远程接口。"
-            : "When enabled, fallback sends the source text to the remote endpoint configured below."
-        defaultValue: true
-    }
-
     StyledText {
         width: parent.width
-        text: root.zh ? "远程 API（回退）" : "Remote API (fallback)"
-        font.pixelSize: Theme.fontSizeLarge
-        font.weight: Font.Bold
-        color: Theme.primary
+        text: root.zh ? "已配置的提供商" : "Configured providers"
+        visible: root.providerList.length > 0
+        font.pixelSize: Theme.fontSizeMedium
+        font.weight: Font.Medium
+        color: Theme.surfaceText
     }
 
-    SecureStringSetting {
-        settingKey: "remoteApiKey"
-        label: root.zh ? "远程 API Key" : "Remote API Key"
-        description: root.zh ? "保留现有云端密钥。" : "Your existing cloud API key."
-        placeholder: "sk-…"
-        defaultValue: root.legacyIsLocal() ? "" : String(root.storedValue("apiKey", ""))
+    Column {
+        width: parent.width
+        spacing: Theme.spacingXS
+
+        Repeater {
+            model: root.providerList
+
+            delegate: StyledRect {
+                required property var modelData
+                required property int index
+                width: parent.width
+                height: 60
+                radius: Theme.cornerRadius
+                color: Theme.withAlpha(Theme.surfaceContainerHigh, Theme.popupTransparency)
+
+                Column {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.spacingM
+                    anchors.right: providerButtons.left
+                    anchors.rightMargin: Theme.spacingS
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+
+                    StyledText {
+                        width: parent.width
+                        text: String(modelData.name || "")
+                        elide: Text.ElideRight
+                        font.pixelSize: Theme.fontSizeMedium
+                        font.weight: Font.Medium
+                        color: Theme.surfaceText
+                    }
+
+                    StyledText {
+                        width: parent.width
+                        text: {
+                            const base = String(modelData.baseUrl || "");
+                            const model = String(modelData.model || "");
+                            return model.length > 0 ? base + "  ·  " + model : base;
+                        }
+                        elide: Text.ElideMiddle
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceVariantText
+                    }
+                }
+
+                Row {
+                    id: providerButtons
+                    anchors.right: parent.right
+                    anchors.rightMargin: Theme.spacingM
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.spacingXS
+
+                    DankButton {
+                        text: root.zh ? "修改" : "Edit"
+                        iconName: "edit"
+                        onClicked: root.editProvider(index)
+                    }
+
+                    DankButton {
+                        text: root.zh ? "删除" : "Delete"
+                        iconName: "delete"
+                        onClicked: root.deleteProvider(index)
+                    }
+                }
+            }
+        }
     }
 
-    StringSetting {
-        settingKey: "remoteBaseUrl"
-        label: root.zh ? "远程 Base URL" : "Remote Base URL"
-        description: root.zh ? "OpenAI 兼容云端地址。" : "OpenAI-compatible cloud URL."
-        placeholder: "https://api.deepseek.com/v1"
-        defaultValue: root.legacyIsLocal() ? "" : root.legacyBaseUrl()
+    StyledRect {
+        width: parent.width
+        radius: Theme.cornerRadius
+        color: Theme.withAlpha(Theme.surfaceContainerHigh, Theme.popupTransparency)
+        height: formColumn.implicitHeight + Theme.spacingM * 2
+
+        Column {
+            id: formColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Theme.spacingM
+            spacing: Theme.spacingXS
+
+            StyledText {
+                text: root.providerEditingIndex >= 0
+                    ? (root.zh ? "修改提供商" : "Edit provider")
+                    : (root.zh ? "添加提供商" : "Add provider")
+                font.pixelSize: Theme.fontSizeMedium
+                font.weight: Font.Medium
+                color: Theme.surfaceText
+            }
+
+            StyledText {
+                text: root.zh ? "名称" : "Name"
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+            }
+
+            DankTextField {
+                id: nameField
+                width: parent.width
+                placeholderText: root.zh ? "示例提供商1" : "provider-one"
+            }
+
+            StyledText {
+                text: "Base URL"
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+            }
+
+            DankTextField {
+                id: baseField
+                width: parent.width
+                placeholderText: "http://127.0.0.1:8080/v1"
+            }
+
+            StyledText {
+                text: root.zh ? "API Key（可选）" : "API Key (optional)"
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+            }
+
+            DankTextField {
+                id: keyField
+                width: parent.width
+                echoMode: TextInput.Password
+                placeholderText: "sk-…"
+            }
+
+            StyledText {
+                text: root.zh ? "模型（此提供商默认的）" : "Model (default for this provider)"
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+            }
+
+            Row {
+                width: parent.width
+                spacing: Theme.spacingS
+
+                DankDropdown {
+                    id: providerModelDropdown
+                    width: Math.max(120, parent.width - syncButton.width - Theme.spacingS)
+                    dropdownWidth: width
+                    text: ""
+                    description: ""
+                    compactMode: true
+                    currentValue: root.draftModel.length > 0
+                        ? root.draftModel
+                        : (root.zh ? "未选择（先同步）" : "None (sync first)")
+                    options: root.providerModelChoices()
+                    onValueChanged: value => {
+                        if (!root.providerDropdownReady)
+                            return;
+                        root.draftModel = String(value || "");
+                    }
+                }
+
+                DankButton {
+                    id: syncButton
+                    text: root.providerBusy ? "…" : (root.zh ? "同步" : "Sync")
+                    iconName: "cloud_download"
+                    onClicked: root.syncProviderModels()
+                }
+            }
+
+            DankTextField {
+                id: customModelField
+                width: parent.width
+                visible: root.draftModel === root.customModelLabel
+                placeholderText: root.zh ? "输入自定义模型 ID（留空则保存同步到的全部模型）" : "Custom model ID (empty saves all synced models)"
+            }
+
+            StyledText {
+                text: root.zh ? "超时（秒）" : "Timeout (seconds)"
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+            }
+
+            DankTextField {
+                id: timeoutField
+                width: parent.width
+                placeholderText: "60"
+            }
+
+            StyledText {
+                text: root.zh
+                    ? "排序（越小越先用；与其他提供商冲突时，同序及之后的顺延一位）"
+                    : "Order (lower is used first; on conflict the same order and below shift down one)"
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                width: parent.width
+                wrapMode: Text.WordWrap
+            }
+
+            DankTextField {
+                id: sortField
+                width: parent.width
+                placeholderText: "1"
+            }
+
+            Row {
+                spacing: Theme.spacingS
+
+                DankButton {
+                    text: root.providerEditingIndex >= 0
+                        ? (root.zh ? "保存" : "Save")
+                        : (root.zh ? "添加" : "Add")
+                    iconName: root.providerEditingIndex >= 0 ? "check" : "add"
+                    onClicked: root.saveProvider()
+                }
+
+                DankButton {
+                    text: root.zh ? "取消" : "Cancel"
+                    iconName: "close"
+                    onClicked: root.resetProviderDraft()
+                }
+            }
+
+            StyledText {
+                width: parent.width
+                text: root.providerStatus
+                visible: root.providerStatus !== ""
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.primary
+                wrapMode: Text.WordWrap
+            }
+        }
     }
 
-    StringSetting {
-        settingKey: "remoteEndpoint"
-        label: root.zh ? "远程 Endpoint" : "Remote endpoint"
-        description: root.zh ? "路径或完整 URL。" : "Path or full URL."
-        placeholder: "/chat/completions"
-        defaultValue: root.legacyIsLocal() ? "/chat/completions" : String(root.storedValue("endpoint", "/chat/completions"))
+    Loader {
+        id: defaultTargetLoader
+        width: parent.width
+        // 等提供商列表就绪再创建：DankDropdown 内部索引在 options 为空时初始化，
+        // 之后再补 options 也不会回填选中项，表现为“重启后默认模型显示为空”。
+        active: root.providerList.length > 0
+        sourceComponent: defaultTargetComponent
     }
 
-    StringSetting {
-        settingKey: "remoteModel"
-        label: root.zh ? "远程模型" : "Remote model"
-        description: root.zh ? "远程接口使用的模型 ID。" : "Model ID used by the remote API."
-        placeholder: "deepseek-chat"
-        defaultValue: root.legacyIsLocal() ? "" : String(root.storedValue("model", ""))
+    Component {
+        id: defaultTargetComponent
+
+        SelectionSetting {
+            id: defaultTargetSetting
+            settingKey: "defaultTarget"
+            label: root.zh ? "默认模型" : "Default model"
+            description: root.zh
+                ? "翻译默认使用的提供商与模型；卡片上的临时切换不会改变这里。"
+                : "Provider and model used by default; temporary switches on the card do not change it."
+            options: root.defaultTargetOptions()
+            defaultValue: root.storedValue("defaultTarget", "")
+        }
     }
 
     ToggleSetting {
@@ -287,22 +751,13 @@ PluginSettings {
 
     ToggleSetting {
         settingKey: "disableThinking"
-        label: root.zh ? "DeepSeek 低延迟翻译" : "Low-latency DeepSeek translation"
+        label: root.zh ? "禁用模型思考" : "Disable model thinking"
         description: root.zh
-            ? "对 DeepSeek 模型关闭思考模式，加快首字输出。"
-            : "Disables thinking mode for DeepSeek models to reduce time to first token."
+            ? "关闭思考模式，避免翻译时死循环；对 OpenAI 兼容后端发送 enable_thinking=false。"
+            : "Turns thinking off to avoid translation loops; sends enable_thinking=false to OpenAI-compatible backends."
         defaultValue: true
     }
 
-    SliderSetting {
-        settingKey: "remoteTimeoutSeconds"
-        label: root.zh ? "远程请求超时" : "Remote timeout"
-        defaultValue: Number(root.storedValue("timeoutSeconds", 120))
-        minimum: 15
-        maximum: 600
-        unit: root.zh ? "秒" : "s"
-        leftIcon: "timer"
-    }
 
     StyledText {
         width: parent.width
@@ -321,6 +776,17 @@ PluginSettings {
         defaultValue: "Chinese (Simplified)"
     }
 
+    SelectionSetting {
+        id: secondaryLanguageSetting
+        settingKey: "secondaryLanguage"
+        label: root.zh ? "副语言" : "Fallback language"
+        description: root.zh
+            ? "可选。默认提示词不引用它；需要在自定义提示词里写 ${secondary_lang} 才会生效。"
+            : "Optional. The default prompt does not use it — reference ${secondary_lang} in a custom prompt."
+        options: root.languages.filter(item => item.value !== "__custom__")
+        defaultValue: "English"
+    }
+
     StringSetting {
         visible: languageSetting.value === "__custom__"
         settingKey: "customTargetLanguage"
@@ -332,7 +798,9 @@ PluginSettings {
     TextAreaSetting {
         settingKey: "prompt"
         label: root.zh ? "提示词" : "Prompt"
-        description: root.zh ? "使用 ${target_lang}。Ctrl+S 保存。" : "Use ${target_lang}. Ctrl+S saves."
+        description: root.zh
+            ? "可用变量：${target_lang}（目标语言）、${secondary_lang}（副语言）、${text}（原文）。支持 `system:` / `user:` 两段式，Ctrl+S 保存。"
+            : "Variables: ${target_lang}, ${secondary_lang}, ${text}. Supports `system:` / `user:` sections. Ctrl+S saves."
         placeholder: root.defaultPrompt
         defaultValue: root.defaultPrompt
         editorHeight: 130

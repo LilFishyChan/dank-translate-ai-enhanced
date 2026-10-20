@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import socket
 import sys
 import urllib.error
@@ -57,6 +58,7 @@ class RouteConfig:
     api_key: str
     model: str
     timeout: float
+    name: str = ""
 
 
 def emit(event_type: str, **payload: Any) -> None:
@@ -80,8 +82,72 @@ def build_url(base_url: str, endpoint: str) -> str:
     return url
 
 
-def render_prompt(prompt: str, target_lang: str) -> str:
-    return prompt.replace("${target_lang}", target_lang)
+DEFAULT_SYSTEM_PROMPT = (
+    "Translate the text provided by the user into ${target_lang}. "
+    "Preserve the original meaning, tone, paragraph structure, Markdown formatting, code, "
+    "names, and numbers. Output only the translation."
+)
+
+
+def render_prompt(prompt: str, target_lang: str, secondary_lang: str = "") -> str:
+    secondary = str(secondary_lang or "").strip() or target_lang
+    return (prompt.replace("${target_lang}", target_lang)
+                  .replace("${secondary_lang}", secondary))
+
+
+def split_prompt_sections(prompt: str) -> tuple[str, str | None]:
+    """Split a prompt into system/user parts.
+
+    Accepts an optional two-section form using ``system:`` and ``user:`` line
+    prefixes. Without those markers the whole prompt is the system message and
+    the source text is sent as the user message (legacy behaviour).
+    """
+    system_lines: list[str] = []
+    user_lines: list[str] = []
+    current = "system"
+    seen_marker = False
+
+    for line in prompt.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("system:"):
+            seen_marker = True
+            current = "system"
+            rest = stripped[len("system:"):].strip()
+            if rest:
+                system_lines.append(rest)
+            continue
+        if lower.startswith("user:"):
+            seen_marker = True
+            current = "user"
+            rest = stripped[len("user:"):].strip()
+            if rest:
+                user_lines.append(rest)
+            continue
+        (system_lines if current == "system" else user_lines).append(line)
+
+    if not seen_marker:
+        return prompt.strip(), None
+    return "\n".join(system_lines).strip(), "\n".join(user_lines).strip()
+
+
+def build_messages(
+    prompt: str, target_lang: str, source_text: str, secondary_lang: str = ""
+) -> list[dict[str, str]]:
+    system_text, user_template = split_prompt_sections(prompt)
+    system_text = render_prompt(system_text, target_lang, secondary_lang)
+    if not system_text:
+        system_text = render_prompt(DEFAULT_SYSTEM_PROMPT, target_lang, secondary_lang)
+    if not user_template:
+        user_text = source_text
+    else:
+        user_text = render_prompt(user_template, target_lang, secondary_lang).replace("${text}", source_text)
+        if not user_text.strip():
+            user_text = source_text
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_text},
+    ]
 
 
 def is_deepseek_request(url: str, model: str) -> bool:
@@ -300,6 +366,7 @@ def _route_from_mapping(
         api_key=str(value.get("api_key") or ""),
         model=model,
         timeout=_coerce_timeout(value.get("timeout"), default_timeout),
+        name=str(value.get("name") or "").strip(),
     )
 
 
@@ -326,10 +393,12 @@ def _run_route(
     prompt: str,
     streaming: bool,
     disable_thinking_setting: bool,
+    secondary_lang: str = "",
 ) -> None:
     url = build_url(route.base_url, route.endpoint)
     deepseek_request = is_deepseek_request(url, route.model)
-    disable_thinking = disable_thinking_setting and deepseek_request
+    deepseek_official = (urllib.parse.urlparse(url).hostname or "").lower() == "api.deepseek.com"
+    disable_thinking = disable_thinking_setting
     headers = {
         "Accept": "text/event-stream, application/json",
         "Content-Type": "application/json",
@@ -339,15 +408,17 @@ def _run_route(
         headers["Authorization"] = f"Bearer {route.api_key}"
 
     payload: dict[str, Any] = {
-        "messages": [
-            {"role": "system", "content": render_prompt(prompt, target_lang)},
-            {"role": "user", "content": source_text},
-        ],
+        "messages": build_messages(prompt, target_lang, source_text, secondary_lang),
         "stream": streaming,
         "model": route.model,
     }
     if disable_thinking:
-        payload["thinking"] = {"type": "disabled"}
+        if deepseek_official:
+            payload["thinking"] = {"type": "disabled"}
+        else:
+            # llama.cpp / vLLM / OpenAI 兼容后端：关模板思考 + 关推理强度
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            payload["reasoning_effort"] = "none"
 
     emit(
         "meta",
@@ -355,12 +426,32 @@ def _run_route(
         model=route.model,
         streaming=streaming,
         thinking_disabled=disable_thinking,
+        target_lang=target_lang,
     )
     try:
         has_translation = _request(url, headers, payload, route.timeout, route.source)
     except ApiResponseError as exc:
         body_lower = exc.body.lower()
-        if streaming and exc.status in {400, 422} and "stream" in body_lower:
+        rejects_thinking = (
+            exc.status in {400, 422}
+            and ("chat_template_kwargs" in body_lower or "reasoning_effort" in body_lower
+                 or "unknown" in body_lower or "unrecognized" in body_lower)
+            and ("chat_template_kwargs" in payload or "reasoning_effort" in payload)
+        )
+        if rejects_thinking:
+            payload.pop("chat_template_kwargs", None)
+            payload.pop("reasoning_effort", None)
+            emit(
+                "meta",
+                source=route.source,
+                model=route.model,
+                streaming=streaming,
+                thinking_fields_dropped=True,
+            )
+            has_translation = _request(
+                url, headers, payload, route.timeout, route.source
+            )
+        elif streaming and exc.status in {400, 422} and "stream" in body_lower:
             payload["stream"] = False
             emit(
                 "meta",
@@ -400,6 +491,7 @@ def run(config: dict[str, Any]) -> None:
 
     source_text = str(config.get("text") or "").strip()
     target_lang = str(config.get("target_lang") or "Chinese (Simplified)").strip()
+    secondary_lang = str(config.get("secondary_lang") or "English").strip()
     prompt = str(config.get("prompt") or "").strip()
     streaming = bool(config.get("stream", True))
     disable_thinking = bool(config.get("disable_thinking", True))
@@ -411,59 +503,60 @@ def run(config: dict[str, Any]) -> None:
     if not prompt:
         raise ConfigError(tr("Prompt is empty.", "提示词为空。"))
 
-    has_routing_config = "local" in config or "api" in config
-    local_route = _route_from_mapping("local", config.get("local"), 15.0)
-    api_route = _route_from_mapping("api", config.get("api"), 120.0)
-    if not has_routing_config:
-        api_route = _legacy_api_route(config)
 
-    allow_remote_fallback = bool(config.get("allow_remote_fallback", True))
+    routes: list[RouteConfig] = []
+    raw_providers = config.get("providers")
+    if isinstance(raw_providers, list):
+        for item in raw_providers:
+            route = _route_from_mapping("provider", item, 60.0)
+            if route:
+                routes.append(route)
+
+    has_routing_config = "local" in config or "api" in config
+    if not routes and has_routing_config:
+        local_route = _route_from_mapping("local", config.get("local"), 15.0)
+        api_route = _route_from_mapping("api", config.get("api"), 120.0)
+        allow_remote_fallback = bool(config.get("allow_remote_fallback", True))
+        if local_route:
+            routes.append(local_route)
+            if api_route and allow_remote_fallback:
+                routes.append(api_route)
+        elif api_route:
+            routes.append(api_route)
+    elif not routes:
+        legacy_route = _legacy_api_route(config)
+        if legacy_route:
+            routes.append(legacy_route)
+
+    if not routes:
+        raise ConfigError(tr("Configure at least one provider.", "请至少配置一个提供商。"))
+
     route_args = {
         "source_text": source_text,
         "target_lang": target_lang,
         "prompt": prompt,
         "streaming": streaming,
         "disable_thinking_setting": disable_thinking,
+        "secondary_lang": secondary_lang,
     }
 
-    if local_route:
+    failures: list[str] = []
+    for index, route in enumerate(routes):
         try:
-            _run_route(local_route, **route_args)
-            emit("done", source="local", model=local_route.model)
+            _run_route(route, **route_args)
+            emit("done", source=route.source, model=route.model, provider=route.name or "")
             return
-        except Exception as local_exc:
-            local_failure = _source_failure("local", local_exc)
-            if api_route and allow_remote_fallback:
+        except Exception as exc:  # try the next provider
+            failures.append(_source_failure(route.name or route.source, exc))
+            if index + 1 < len(routes):
                 emit(
                     "fallback",
-                    from_source="local",
-                    to_source="api",
-                    message=local_failure,
+                    from_source=route.name or route.source,
+                    to_source=routes[index + 1].name or routes[index + 1].source,
+                    message=failures[-1],
                 )
-                try:
-                    _run_route(api_route, **route_args)
-                    emit("done", source="api", model=api_route.model)
-                    return
-                except Exception as api_exc:
-                    raise TranslationError(
-                        local_failure + "\n" + _source_failure("api", api_exc)
-                    ) from api_exc
-            raise TranslationError(local_failure) from local_exc
 
-    if api_route:
-        try:
-            _run_route(api_route, **route_args)
-            emit("done", source="api", model=api_route.model)
-            return
-        except Exception as api_exc:
-            raise TranslationError(_source_failure("api", api_exc)) from api_exc
-
-    raise ConfigError(
-        tr(
-            "Configure a local model or a remote API model.",
-            "请配置本地模型或远程 API 模型。",
-        )
-    )
+    raise TranslationError("\n".join(failures))
 
 
 def main() -> int:

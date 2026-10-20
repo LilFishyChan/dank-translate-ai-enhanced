@@ -141,7 +141,10 @@ class TranslateStreamTests(unittest.TestCase):
         run_route.assert_called_once()
         self.assertEqual(run_route.call_args.args[0].source, "local")
         events = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(events, [{"type": "done", "source": "local", "model": "local-model"}])
+        self.assertEqual(
+            events,
+            [{"type": "done", "source": "local", "model": "local-model", "provider": ""}],
+        )
 
     def test_local_failure_falls_back_to_remote_api(self):
         output = io.StringIO()
@@ -211,7 +214,7 @@ class TranslateStreamTests(unittest.TestCase):
         config = self.routing_config()
         config["local"]["model"] = ""
         config["api"]["model"] = ""
-        with self.assertRaisesRegex(client.ConfigError, "Configure a local model"):
+        with self.assertRaisesRegex(client.ConfigError, "Configure at least one provider"):
             client.run(config)
 
     def test_extract_stream_delta(self):
