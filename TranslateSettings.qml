@@ -433,6 +433,10 @@ PluginSettings {
     ]
     readonly property var languages: {
         const result = [];
+        result.push({
+            label: root.zh ? "跟随界面语言" : "Follow UI language",
+            value: "auto"
+        });
         for (let i = 0; i < languageEntries.length; i++) {
             const item = languageEntries[i];
             result.push({
@@ -768,12 +772,34 @@ PluginSettings {
     }
 
     SelectionSetting {
+        settingKey: "popupAnchor"
+        label: root.zh ? "窗口位置" : "Popup position"
+        description: root.zh ? "翻译浮窗出现的位置。" : "Where the translation card appears."
+        options: [
+            { label: root.zh ? "上方浮窗" : "Top overlay", value: "top" },
+            { label: root.zh ? "下方浮窗" : "Bottom overlay", value: "bottom" },
+            { label: root.zh ? "左侧边栏" : "Left sidebar", value: "left" },
+            { label: root.zh ? "右侧边栏" : "Right sidebar", value: "right" }
+        ]
+        defaultValue: "top"
+    }
+
+    ToggleSetting {
+        settingKey: "autoTranslate"
+        label: root.zh ? "自动翻译选中/剪贴板文本" : "Translate selection/clipboard automatically"
+        description: root.zh
+            ? "关闭后只把捕获到的文本预填进卡片，点「翻译」或按 Ctrl+Enter 才发送。"
+            : "When off, captured text is only prefilled — press translate or Ctrl+Enter to send."
+        defaultValue: true
+    }
+
+    SelectionSetting {
         id: languageSetting
         settingKey: "targetLanguage"
         label: root.zh ? "目标语言" : "Target language"
         description: root.zh ? "替换 ${target_lang}。" : "Replaces ${target_lang}."
         options: root.languages
-        defaultValue: "Chinese (Simplified)"
+        defaultValue: "auto"
     }
 
     SelectionSetting {

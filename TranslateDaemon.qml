@@ -427,6 +427,15 @@ PluginComponent {
         startTranslation(text);
     }
 
+    function prefillText(value) {
+        currentStatus = "idle";
+        currentPhase = "idle";
+        currentOriginal = String(value || "");
+        currentTranslation = "";
+        currentError = "";
+        showPopup();
+    }
+
     function openManualInput() {
         currentStatus = "idle";
         currentPhase = "idle";
@@ -592,7 +601,10 @@ PluginComponent {
         if (exitCode === 0 && text.length > 0) {
             lastClipboardEntryId = reader.clipboardEntryId;
             inputBaselineReady = true;
-            startTranslation(text);
+            if (autoTranslateEnabled)
+                startTranslation(text);
+            else
+                prefillText(text);
             return;
         }
 
@@ -645,9 +657,11 @@ PluginComponent {
     function resolvedTargetLanguage() {
         if (String(languageOverride || "").trim().length > 0)
             return String(languageOverride).trim();
-        const selected = String(pluginData?.targetLanguage ?? "Chinese (Simplified)");
+        const selected = String(pluginData?.targetLanguage ?? "auto");
         if (selected === "__custom__")
             return String(pluginData?.customTargetLanguage ?? "").trim();
+        if (selected === "auto" || selected.length === 0)
+            return defaultLanguageForLocale();
         return selected;
     }
 
@@ -1145,6 +1159,43 @@ PluginComponent {
         return wantedProvider.length > 0 ? (wantedProvider + " · " + wantedModel) : wantedModel;
     }
 
+    readonly property string popupAnchor: {
+        const value = String(pluginData?.popupAnchor ?? "top");
+        return value === "bottom" || value === "left" || value === "right" ? value : "top";
+    }
+
+    readonly property bool autoTranslateEnabled: pluginData?.autoTranslate !== false
+
+    function defaultLanguageForLocale() {
+        const raw = String(SessionData.locale || Qt.locale().name || "").toLowerCase();
+        if (raw.indexOf("zh") === 0) {
+            if (raw.indexOf("tw") >= 0 || raw.indexOf("hk") >= 0 || raw.indexOf("hant") >= 0)
+                return "Chinese (Traditional)";
+            return "Chinese (Simplified)";
+        }
+        return "English";
+    }
+
+    // 当前主语言与英语置顶，其余保持原顺序
+    readonly property var orderedLanguageChoices: {
+        const setting = String(pluginData?.targetLanguage ?? "auto");
+        const primary = resolvedTargetLanguage();
+        const list = [];
+        const seen = {};
+        const push = function (value) {
+            const key = String(value || "");
+            if (!key || seen[key])
+                return;
+            seen[key] = true;
+            list.push({ label: languageLabel(key), value: key });
+        };
+        push(primary);
+        push("English");
+        for (let i = 0; i < languageChoices.length; i++)
+            push(languageChoices[i].value);
+        return list;
+    }
+
     function languageLabel(value) {
         for (let i = 0; i < languageChoices.length; i++) {
             if (String(languageChoices[i].value) === String(value))
@@ -1171,7 +1222,7 @@ PluginComponent {
     function menuItems() {
         if (menuName === "language") {
             const labels = [];
-            const entries = languageChoices;
+            const entries = orderedLanguageChoices;
             for (let i = 0; i < entries.length; i++)
                 labels.push(String(entries[i].label));
             return labels;
@@ -1541,6 +1592,10 @@ PluginComponent {
             ? Math.min(760, Math.max(360, screen.width - 32))
             : 680
         readonly property real topOffset: Theme.barHeight + Theme.spacingL
+        // 侧边栏模式：垂直居中，内容高度不影响位置计算（内容不依赖 margins）
+        readonly property real sideOffset: screen
+            ? Math.max(topOffset, Math.round((screen.height - implicitHeight) / 2))
+            : topOffset
         readonly property real maxCardHeight: screen
             ? Math.max(1, Math.floor(screen.height * 0.5 - topOffset))
             : 400
@@ -1575,6 +1630,8 @@ PluginComponent {
         implicitWidth: contentWidth
         implicitHeight: popupCard.height
 
+        // 统一用 top+left 锚点 + margins 定位：anchors.right 在 layer-shell 上
+        // 与 margins.right 组合时位置不稳定，四角都改用计算出的 margin。
         anchors {
             top: true
             left: true
@@ -1590,10 +1647,28 @@ PluginComponent {
             ? WlrKeyboardFocus.OnDemand
             : WlrKeyboardFocus.None
         WlrLayershell.margins {
-            left: popupWindow.screen
-                ? Math.max(0, Math.round(popupWindow.screen.width / 2 - popupWindow.implicitWidth / 2))
-                : 0
-            top: popupWindow.topOffset
+            left: {
+                if (root.popupAnchor === "left")
+                    return Theme.spacingL;
+                if (root.popupAnchor === "right") {
+                    return popupWindow.screen
+                        ? Math.max(0, popupWindow.screen.width - popupWindow.implicitWidth - Theme.spacingL)
+                        : 0;
+                }
+                return popupWindow.screen
+                    ? Math.max(0, Math.round(popupWindow.screen.width / 2 - popupWindow.implicitWidth / 2))
+                    : 0;
+            }
+            top: {
+                if (root.popupAnchor === "top")
+                    return popupWindow.topOffset;
+                if (root.popupAnchor === "bottom") {
+                    return popupWindow.screen
+                        ? Math.max(0, popupWindow.screen.height - popupWindow.implicitHeight - Theme.spacingL)
+                        : 0;
+                }
+                return popupWindow.sideOffset;
+            }
         }
 
         StyledRect {
@@ -1851,7 +1926,9 @@ PluginComponent {
                             text: root.currentStatus === "error"
                                 ? root.currentError
                                 : (root.currentTranslation || (root.currentStatus === "idle"
-                                    ? root.t("Type or paste text to translate first.", "请先输入或粘贴要翻译的文字。")
+                                    ? (root.currentOriginal.length > 0
+                                        ? root.t("Press translate to start.", "点「翻译」开始。")
+                                        : root.t("Type or paste text to translate first.", "请先输入或粘贴要翻译的文字。"))
                                     : (root.currentPhase === "waiting"
                                     ? root.t("Waiting for model…", "等待模型响应…")
                                     : root.t("Starting translator…", "正在启动翻译…"))))
@@ -2045,13 +2122,16 @@ PluginComponent {
 
                         DankActionButton {
                             id: manualTranslateButton
-                            visible: popupWindow.hasManualInput
+                            visible: root.currentStatus === "idle" && !root.editingOriginal
                             buttonSize: 30
                             iconName: "translate"
                             iconColor: Theme.primaryText
                             backgroundColor: Theme.primary
-                            tooltipText: root.t("Translate typed text (Ctrl+Enter)", "翻译输入的文本（Ctrl+Enter）")
-                            onClicked: root.translateManual(manualEdit.text)
+                            tooltipText: root.t("Translate (Ctrl+Enter)", "翻译（Ctrl+Enter）")
+                            onClicked: {
+                                const typed = String(manualEdit.text || "").trim();
+                                root.translateManual(typed.length > 0 ? typed : root.currentOriginal);
+                            }
                         }
 
                         DankActionButton {
