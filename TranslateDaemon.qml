@@ -1161,10 +1161,11 @@ PluginComponent {
 
     readonly property string popupAnchor: {
         const value = String(pluginData?.popupAnchor ?? "top");
-        return value === "bottom" || value === "left" || value === "right" ? value : "top";
+        return value === "bottom" ? value : "top";
     }
 
     readonly property bool autoTranslateEnabled: pluginData?.autoTranslate !== false
+    readonly property bool dismissOnClickOutside: pluginData?.dismissOnClickOutside !== false
 
     function defaultLanguageForLocale() {
         const raw = String(SessionData.locale || Qt.locale().name || "").toLowerCase();
@@ -1592,10 +1593,6 @@ PluginComponent {
             ? Math.min(760, Math.max(360, screen.width - 32))
             : 680
         readonly property real topOffset: Theme.barHeight + Theme.spacingL
-        // 侧边栏模式：垂直居中，内容高度不影响位置计算（内容不依赖 margins）
-        readonly property real sideOffset: screen
-            ? Math.max(topOffset, Math.round((screen.height - implicitHeight) / 2))
-            : topOffset
         readonly property real maxCardHeight: screen
             ? Math.max(1, Math.floor(screen.height * 0.5 - topOffset))
             : 400
@@ -1634,9 +1631,10 @@ PluginComponent {
         // 与 margins.right 组合时位置不稳定，四角都改用计算出的 margin。
         anchors {
             top: true
+            bottom: true
             left: true
+            right: true
         }
-
         WlrLayershell.namespace: "dms:dank-translate-ai"
         WlrLayershell.layer: WlrLayershell.Overlay
         WlrLayershell.exclusiveZone: -1
@@ -1646,41 +1644,40 @@ PluginComponent {
         WlrLayershell.keyboardFocus: root.popupVisible
             ? WlrKeyboardFocus.OnDemand
             : WlrKeyboardFocus.None
-        WlrLayershell.margins {
-            left: {
-                if (root.popupAnchor === "left")
-                    return Theme.spacingL;
-                if (root.popupAnchor === "right") {
-                    return popupWindow.screen
-                        ? Math.max(0, popupWindow.screen.width - popupWindow.implicitWidth - Theme.spacingL)
-                        : 0;
-                }
-                return popupWindow.screen
-                    ? Math.max(0, Math.round(popupWindow.screen.width / 2 - popupWindow.implicitWidth / 2))
-                    : 0;
-            }
-            top: {
-                if (root.popupAnchor === "top")
-                    return popupWindow.topOffset;
-                if (root.popupAnchor === "bottom") {
-                    return popupWindow.screen
-                        ? Math.max(0, popupWindow.screen.height - popupWindow.implicitHeight - Theme.spacingL)
-                        : 0;
-                }
-                return popupWindow.sideOffset;
-            }
+        readonly property real cardX: screen
+            ? Math.max(0, Math.round((screen.width - implicitWidth) / 2))
+            : Theme.spacingL
+        readonly property real cardY: {
+            if (!screen)
+                return topOffset;
+            if (root.popupAnchor === "bottom")
+                return Math.max(0, screen.height - implicitHeight - Theme.spacingL);
+            return topOffset;
+        }
+
+        MouseArea {
+            id: dismissLayer
+            anchors.fill: parent
+            enabled: root.dismissOnClickOutside
+            onClicked: root.closePopup()
         }
 
         StyledRect {
             id: popupCard
-            x: 0
-            y: 0
+            x: popupWindow.cardX
+            y: popupWindow.cardY
             width: popupWindow.contentWidth
             height: popupColumn.implicitHeight + Theme.spacingM * 2
             radius: Theme.cornerRadius
             color: Theme.withAlpha(Theme.surfaceContainer, Theme.popupTransparency)
             border.width: 1
             border.color: Theme.outlineMedium
+
+            // 卡片区域内吞掉点击，避免点空白处被判成“点了外部”
+            MouseArea {
+                anchors.fill: parent
+                onClicked: {}
+            }
 
             Column {
                 id: popupColumn
@@ -2203,7 +2200,14 @@ PluginComponent {
             }
         }
 
-        mask: Region {
+        // 开启“点击外部关闭”时不设 mask，全屏背景层才能收到那次点击；
+        // 关闭时输入区域收窄到卡片，点击照常穿透到下面的应用。
+        mask: root.dismissOnClickOutside
+            ? null
+            : cardRegion
+
+        Region {
+            id: cardRegion
             item: popupCard
         }
     }

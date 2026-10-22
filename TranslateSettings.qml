@@ -778,10 +778,18 @@ PluginSettings {
         options: [
             { label: root.zh ? "上方浮窗" : "Top overlay", value: "top" },
             { label: root.zh ? "下方浮窗" : "Bottom overlay", value: "bottom" },
-            { label: root.zh ? "左侧边栏" : "Left sidebar", value: "left" },
-            { label: root.zh ? "右侧边栏" : "Right sidebar", value: "right" }
+
         ]
         defaultValue: "top"
+    }
+
+    ToggleSetting {
+        settingKey: "dismissOnClickOutside"
+        label: root.zh ? "点击浮层外关闭" : "Close when clicking outside"
+        description: root.zh
+            ? "翻译浮窗失去焦点时自动关闭。"
+            : "Close the card when it loses focus."
+        defaultValue: true
     }
 
     ToggleSetting {
